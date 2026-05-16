@@ -1,0 +1,11 @@
+[Unit]
+Description=Cacophony Project Solar Battery Tester
+After=multi-user.target
+
+[Service]
+ExecStart=/usr/bin/solar-battery-tester
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target
