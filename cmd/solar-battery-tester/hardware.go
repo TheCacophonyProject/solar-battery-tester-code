@@ -6,6 +6,7 @@ import (
 	"math"
 	"math/rand"
 	"os"
+	"path/filepath"
 	"slices"
 	"strconv"
 	"time"
@@ -187,6 +188,8 @@ func (hw *hardware) setCCLoads(count int) error {
 			return fmt.Errorf("set CC load %d: %v", i+1, err)
 		}
 	}
+	current := 0.5 * float64(count)
+	log.Infof("Set %d CC loads (current = %.1fA)", count, current)
 	return hw.setFan(count > 0)
 }
 
@@ -226,7 +229,7 @@ func (hw *hardware) readDischargeMonitor() (voltage, current float64, err error)
 func (hw *hardware) readBatteryVoltage() (volts float64, err error) {
 	err = withRetry("battery voltage", 3, func() error {
 		raw, e := hw.adc.readChannel(0)
-		log.Println(raw)
+		//log.Println(raw)
 		if e != nil {
 			return e
 		}
@@ -281,7 +284,6 @@ func voltageToTemperature(v float64) (float64, error) {
 func (hw *hardware) readTemperature() (tempC float64, err error) {
 	err = withRetry("temperature", 3, func() error {
 		v, e := hw.adc.readChannel(1)
-		log.Println(v)
 		if e != nil {
 			return e
 		}
@@ -299,9 +301,6 @@ func gpioLevel(high bool) gpio.Level {
 }
 
 func (hw *hardware) testCharge(battStateChan chan BatteryStatus) (bool, error) {
-	log.Println("Waiting for battery status.")
-	<-battStateChan
-
 	// Enable battery charging
 	if err := hw.setChargeEnable(true); err != nil {
 		log.Printf("Error setting charge enable: %v", err)
@@ -309,6 +308,9 @@ func (hw *hardware) testCharge(battStateChan chan BatteryStatus) (bool, error) {
 	defer func() {
 		hw.setChargeEnable(false)
 	}()
+
+	log.Println("Waiting for battery status.")
+	<-battStateChan
 
 	// Get new status
 	log.Println("Waiting for battery status.")
@@ -388,7 +390,10 @@ func (hw *hardware) testDischarge(battStateChan chan BatteryStatus) (bool, error
 
 // overCurrentDischargeTest will return true if the battery passes the test.
 func (hw *hardware) overCurrentDischargeTest(battStateChan chan BatteryStatus) (bool, error) {
-	// TODO update firmware on the battery to send an updated battery status when a over discharge is detected
+	// Disable battery charging
+	if err := hw.setChargeEnable(false); err != nil {
+		log.Printf("Error setting charge enable: %v", err)
+	}
 
 	log.Println("Waiting for battery status.")
 	<-battStateChan
@@ -409,14 +414,17 @@ func (hw *hardware) overCurrentDischargeTest(battStateChan chan BatteryStatus) (
 	time.Sleep(200 * time.Millisecond)
 
 	// Take battery voltage reading during OCD
-	ocdBatteryVoltage, err := hw.readBatteryVoltage()
+	ocdBatterySenseVoltage, err := hw.readBatteryVoltage()
 	if err != nil {
 		return false, fmt.Errorf("reading battery voltage: %v", err)
 	}
+	voltage, current, err := hw.readChargeMonitor()
+	if err != nil {
+		log.Errorf("Reading charge monitor: %v", err)
+		return false, err
+	}
 	hw.setCCLoads(0)
-
-	log.Info("Waiting for battery status.")
-	batteryStatus := <-battStateChan
+	log.Info("Stopping over current discharge.")
 
 	log.Info("Waiting for battery voltage to recover.")
 	recovered := false
@@ -427,6 +435,7 @@ func (hw *hardware) overCurrentDischargeTest(battStateChan chan BatteryStatus) (
 			return false, fmt.Errorf("reading battery voltage: %v", err)
 		}
 		if batV > 9 {
+			log.Println("Battery voltage recovered.")
 			recovered = true
 			break
 		}
@@ -436,9 +445,10 @@ func (hw *hardware) overCurrentDischargeTest(battStateChan chan BatteryStatus) (
 		return false, nil
 	}
 
-	log.Infof("Battery Status: %s", batteryStatus)
-	log.Infof("Battery Voltage Before: %v", batteryVoltage)
-	log.Infof("Battery Voltage During OCD: %v", ocdBatteryVoltage)
+	//log.Infof("Battery Status: %s", batteryStatus)
+	log.Infof("Battery Before OCD; SenseVoltage: %v", fmtF(batteryVoltage))
+	log.Infof("Battery During OCD; Sense Voltage: %v", fmtF(ocdBatterySenseVoltage))
+	log.Infof("Battery During OCD: Voltage: %v, Current: %v", fmtF(voltage), fmtF(current))
 
 	return true, nil
 }
@@ -502,24 +512,273 @@ func (hw *hardware) testShortCircuit(battStateChan chan BatteryStatus) (bool, er
 	return true, nil
 }
 
-func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus) error {
+type hardwareState struct {
+	dischargeCurrent float64
+	chargeCurrent    float64
+	dischargeVoltage float64
+	chargeVoltage    float64
+	senseVoltage     float64
+	ccLoadTemp       float64
+}
+
+func (hw *hardware) readSensors() *hardwareState {
+	dischargeVoltage, dischargeCurrent, err := hw.readDischargeMonitor()
+	if err != nil {
+		log.Warnf("Reading charge monitor: %v", err)
+		return nil
+	}
+	chargeVoltage, chargeCurrent, err := hw.readChargeMonitor()
+	if err != nil {
+		log.Warnf("Reading charge monitor: %v", err)
+		return nil
+	}
+	ccLoadTemp, err := hw.readTemperature()
+	if err != nil {
+		log.Warnf("Reading temperature: %v", err)
+		return nil
+	}
+	senseVoltage, err := hw.readBatteryVoltage()
+	if err != nil {
+		log.Warnf("Reading battery voltage: %v", err)
+		return nil
+	}
+
+	return &hardwareState{
+		dischargeCurrent: dischargeCurrent,
+		chargeCurrent:    chargeCurrent,
+		dischargeVoltage: dischargeVoltage,
+		chargeVoltage:    chargeVoltage,
+		senseVoltage:     senseVoltage,
+		ccLoadTemp:       ccLoadTemp,
+	}
+}
+
+// runChargeSeq will charge the battery to the target voltage. If you want to charge until the battery is fill leave targetVoltage = 0.
+func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus, targetVoltage float64, dataDir string) error {
+	if targetVoltage == 0 {
+		log.Info("Running charge sequence until battery is full")
+	} else {
+		log.Infof("Running charge sequence to %.1fV", targetVoltage)
+	}
+
 	if err := hw.setChargeEnable(true); err != nil {
 		return fmt.Errorf("setting charge enable: %v", err)
 	}
 
-	csvFilename := fmt.Sprintf("charge_%s.csv", time.Now().Format("2006-01-02_15-04-05"))
-	f, err := os.Create(csvFilename)
-	if err != nil {
-		return fmt.Errorf("creating CSV file: %v", err)
+	if err := hw.setCCLoads(0); err != nil {
+		return fmt.Errorf("setting CC loads: %v", err)
 	}
-	defer f.Close()
+
+	cleanupFunc, writer, err := makeStateCSVWriter(dataDir, "charging")
+	if err != nil {
+		return err
+	}
+	defer cleanupFunc()
+
+	timeout := time.After(chargeTimeoutDuration)
+	var lastReportTime time.Time
+	for {
+		select {
+		case <-timeout:
+			return fmt.Errorf("charge sequence timed out after %s", chargeTimeoutDuration)
+		case batteryState := <-battStateChan:
+
+			// Read the sensors on the HAT
+			hardwareState := hw.readSensors()
+			if err := writeCSVState(hardwareState, batteryState, writer); err != nil {
+				return err
+			}
+
+			if time.Since(lastReportTime) > time.Minute {
+				lastReportTime = time.Now()
+				log.Printf("Charging: %dmV %dmA", batteryState.VbatmV, batteryState.IbatmA)
+			}
+
+			// Write date to CSV file
+			if err := writeCSVState(hardwareState, batteryState, writer); err != nil {
+				return err
+			}
+
+			// Check if the charge sequence is complete
+			if batteryState.chargingStatus == chargeTerminationDone {
+				log.Info("Battery full charged. Ending charge sequence.")
+				return nil
+			}
+
+			// Check if target voltage has been reached
+			if targetVoltage != 0 {
+				if batteryState.VbatmV >= uint16(targetVoltage*1000) {
+					log.Info("Target voltage reached. Ending charge sequence.")
+					return nil
+				}
+			}
+		}
+	}
+}
+
+func (hw *hardware) runMonitorTest(battStateChan chan BatteryStatus, dataDir string) error {
+	// Disable charging
+	if err := hw.setChargeEnable(false); err != nil {
+		return fmt.Errorf("setting charge enable: %v", err)
+	}
+
+	// Disable CC loads
+	if err := hw.setCCLoads(0); err != nil {
+		return fmt.Errorf("setting CC loads: %v", err)
+	}
+
+	cleanup, writer, err := makeStateCSVWriter(dataDir, "monitoring")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	duration := time.After(12 * time.Hour)
+	var lastReportTime time.Time
+	for {
+		select {
+		case <-duration:
+			log.Info("Monitoring sequence finished.")
+			return nil
+		case batteryState := <-battStateChan:
+			// Read the sensors on the HAT
+			hardwareState := hw.readSensors()
+			if err := writeCSVState(hardwareState, batteryState, writer); err != nil {
+				return err
+			}
+
+			if time.Since(lastReportTime) > time.Minute {
+				lastReportTime = time.Now()
+				log.Printf("Monitoring: %dmV %dmA", batteryState.VbatmV, batteryState.IbatmA)
+			}
+
+			if err := writeCSVState(hardwareState, batteryState, writer); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir string) error {
+	log.Println("Waiting for battery status.")
+	<-battStateChan
+
+	// Disable charging
+	if err := hw.setChargeEnable(false); err != nil {
+		return fmt.Errorf("setting charge enable: %v", err)
+	}
+
+	// Enable CC loads
+	if err := hw.setCCLoads(4); err != nil {
+		return fmt.Errorf("setting CC loads: %v", err)
+	}
+
+	cleanup, writer, err := makeStateCSVWriter(dataDir, "discharge")
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	timeout := time.After(12 * time.Hour)
+	var lastReportTime time.Time
+	lastVoltageReading := 0.0
+	for {
+		select {
+		case <-timeout:
+			return fmt.Errorf("charge sequence timed out after 12 hours")
+		case <-time.After(30 * time.Second):
+			log.Info("Message taking too long, checking if battery has discharged.")
+			if lastVoltageReading < 9.5 {
+				log.Info("Battery has discharged, stopping.")
+				return nil
+			}
+		case batteryState := <-battStateChan:
+
+			hardwareState := hw.readSensors()
+			if err := writeCSVState(hardwareState, batteryState, writer); err != nil {
+				return err
+			}
+
+			if time.Since(lastReportTime) > time.Minute {
+				lastReportTime = time.Now()
+				log.Printf("Discharging: %dmV %dmA", hardwareState.dischargeVoltage, hardwareState.dischargeCurrent)
+			}
+
+			if hardwareState.dischargeVoltage < 1 {
+				log.Info("Discharge sequence complete.")
+				return nil
+			}
+		}
+	}
+}
+
+func writeCSVState(hardwareState *hardwareState, batteryState BatteryStatus, writer *csv.Writer) error {
+	tempAHT := float64(batteryState.TempAHTdC) / 10
+	tempBQ76920 := float64(batteryState.TempBQ76920dC) / 10
+	tempBQ25798 := float64(batteryState.TempBQ25798dC) / 10
+
+	log.Debugf(
+		"in=%.0fmV/%.0fmA out=%.0fmV/%.0fmA sense=%.0fmV ccTemp=%.1f°C | "+
+			"tempAHT=%.1f°C tempBQ76920=%.1f°C tempBQ25798=%.1f°C | "+
+			"cell1=%dmV cell2=%dmV cell3=%dmV vbus=%dmV vbat=%dmV | "+
+			"ibus=%dmA ibat=%dmA ibatCC=%dmA | chargingStatus=%s",
+		hardwareState.chargeVoltage*1000, hardwareState.chargeCurrent*1000,
+		hardwareState.dischargeVoltage*1000, hardwareState.dischargeCurrent*1000,
+		hardwareState.senseVoltage*1000, hardwareState.ccLoadTemp,
+		tempAHT, tempBQ76920, tempBQ25798,
+		batteryState.Cell1mV, batteryState.Cell2mV, batteryState.Cell3mV, batteryState.VbusmV, batteryState.VbatmV,
+		batteryState.IbusmA, batteryState.IbatmA, batteryState.IbatCCmA,
+		batteryState.chargingStatus,
+	)
+
+	row := []string{
+		time.Now().Format(time.RFC3339),
+		// HAT readings
+		fmtF(hardwareState.chargeVoltage * 1000),    // HAT_mV_In
+		fmtF(hardwareState.chargeCurrent * 1000),    // HAT_mA_In
+		fmtF(hardwareState.dischargeVoltage * 1000), // HAT_mV_Out
+		fmtF(hardwareState.dischargeCurrent * 1000), // HAT_mA_Out
+		fmtF(hardwareState.senseVoltage * 1000),     // HAT_mV_Sense
+		fmtF(hardwareState.ccLoadTemp),              // HAT_CC_Temp
+		// Battery readings
+		fmtF(tempAHT),                        // tempAHT_C
+		fmtF(tempBQ76920),                    // tempBQ76920_C
+		fmtF(tempBQ25798),                    // tempBQ25798_C
+		fmtI(int(batteryState.Cell1mV)),      // cell1_mV
+		fmtI(int(batteryState.Cell2mV)),      // cell2_mV
+		fmtI(int(batteryState.Cell3mV)),      // cell3_mV
+		fmtI(int(batteryState.VbusmV)),       // vbus_mV
+		fmtI(int(batteryState.VbatmV)),       // vbat_mV
+		fmtI(int(batteryState.IbusmA)),       // ibus_mA
+		fmtI(int(batteryState.IbatmA)),       // ibat_mA
+		fmtI(int(batteryState.IbatCCmA)),     // ibatCC_mA
+		batteryState.chargingStatus.String(), // chargingStatus
+	}
+	if err := writer.Write(row); err != nil {
+		log.Warnf("Writing CSV row: %v", err)
+	}
+	writer.Flush()
+	return nil
+}
+
+func makeStateCSVWriter(dataDir, prefix string) (func(), *csv.Writer, error) {
+	csvFilename := fmt.Sprintf("%s_%s.csv", prefix, time.Now().Format("2006-01-02_15-04-05"))
+	f, err := os.Create(filepath.Join(dataDir, csvFilename))
+	if err != nil {
+		return nil, nil, fmt.Errorf("creating CSV file: %v", err)
+	}
 
 	w := csv.NewWriter(f)
-	defer w.Flush()
 
 	header := []string{
 		"timestamp",
-		"voltage_V", "current_A",
+
+		// Readings from the HAT
+		"HAT_mV_In", "HAT_mA_In",
+		"HAT_mV_Out", "HAT_mA_Out", "HAT_mV_Sense",
+		"HAT_CC_Temp",
+
+		// Readings from the battery
 		"tempAHT_C", "tempBQ76920_C", "tempBQ25798_C",
 		"cell1_mV", "cell2_mV", "cell3_mV",
 		"vbus_mV", "vbat_mV",
@@ -527,57 +786,22 @@ func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus) error {
 		"chargingStatus",
 	}
 	if err := w.Write(header); err != nil {
-		return fmt.Errorf("writing CSV header: %v", err)
+		return nil, nil, fmt.Errorf("writing CSV header: %v", err)
+	}
+	w.Flush()
+
+	cleanup := func() {
+		w.Flush()
+		f.Close()
 	}
 
-	fmtF := func(f float64) string { return strconv.FormatFloat(f, 'f', 3, 64) }
-	fmtI := func(i int) string { return strconv.Itoa(i) }
+	return cleanup, w, nil
+}
 
-	timeout := time.After(12 * time.Hour)
-	for {
-		select {
-		case <-timeout:
-			return fmt.Errorf("charge sequence timed out after 12 hours")
-		case state := <-battStateChan:
-			voltage, current, err := hw.readChargeMonitor()
-			if err != nil {
-				log.Warnf("Reading charge monitor: %v", err)
-				continue
-			}
+func fmtF(f float64) string {
+	return strconv.FormatFloat(f, 'f', 3, 64)
+}
 
-			tempAHT := float64(state.TempAHTdC) / 10
-			tempBQ76920 := float64(state.TempBQ76920dC) / 10
-			tempBQ25798 := float64(state.TempBQ25798dC) / 10
-
-			log.Infof(
-				"voltage=%.3fV current=%.3fA | tempAHT=%.1f°C tempBQ76920=%.1f°C tempBQ25798=%.1f°C | "+
-					"cell1=%dmV cell2=%dmV cell3=%dmV vbus=%dmV vbat=%dmV | "+
-					"ibus=%dmA ibat=%dmA ibatCC=%dmA | chargingStatus=%s",
-				voltage, current,
-				tempAHT, tempBQ76920, tempBQ25798,
-				state.Cell1mV, state.Cell2mV, state.Cell3mV, state.VbusmV, state.VbatmV,
-				state.IbusmA, state.IbatmA, state.IbatCCmA,
-				state.chargingStatus,
-			)
-
-			row := []string{
-				time.Now().Format(time.RFC3339),
-				fmtF(voltage), fmtF(current),
-				fmtF(tempAHT), fmtF(tempBQ76920), fmtF(tempBQ25798),
-				fmtI(int(state.Cell1mV)), fmtI(int(state.Cell2mV)), fmtI(int(state.Cell3mV)),
-				fmtI(int(state.VbusmV)), fmtI(int(state.VbatmV)),
-				fmtI(int(state.IbusmA)), fmtI(int(state.IbatmA)), fmtI(int(state.IbatCCmA)),
-				state.chargingStatus.String(),
-			}
-			if err := w.Write(row); err != nil {
-				log.Warnf("Writing CSV row: %v", err)
-			}
-			w.Flush()
-
-			if state.chargingStatus == chargeTerminationDone {
-				log.Info("Charge sequence complete.")
-				return nil
-			}
-		}
-	}
+func fmtI(i int) string {
+	return strconv.Itoa(i)
 }

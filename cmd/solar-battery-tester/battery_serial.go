@@ -157,7 +157,7 @@ const (
 // runBatteryMonitor reads and prints battery status messages in a loop until interrupted,
 // writing each parsed status into ch.
 func runBatteryMonitor(serialDev string, ch chan<- BatteryStatus) error {
-	log.Printf("Monitoring battery UART on %s at %d baud — press Ctrl-C to stop", serialDev, batteryBaudRate)
+	log.Printf("Monitoring battery UART on %s at %d baud", serialDev, batteryBaudRate)
 	port, err := serial.OpenPort(&serial.Config{
 		Name:        serialDev,
 		Baud:        batteryBaudRate,

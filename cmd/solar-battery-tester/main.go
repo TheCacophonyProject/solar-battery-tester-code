@@ -18,6 +18,8 @@ package main
 
 import (
 	"fmt"
+	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/TheCacophonyProject/go-utils/logging"
@@ -35,8 +37,11 @@ const (
 	ocdTestTimeout        = 5 * time.Second
 	shortCircuitTimeout   = 2 * time.Second
 	chargeMonitorInterval = 5 * time.Minute
-	chargeMonitorDuration = 24 * time.Hour
+	chargeMonitorDuration = 10 * time.Minute
 	logInterval           = 10 * time.Second
+	chargeTimeoutDuration = 12 * time.Hour
+	dataDir               = "/var/lib/solar-battery-tester/data"
+	restVoltage           = 11.3
 )
 
 var log = logging.NewLogger("info")
@@ -46,13 +51,14 @@ type Args struct {
 	BatterySerial string `arg:"--battery-serial" default:"/dev/serial0" help:"Serial device for battery UART"`
 
 	// Tests
-	TestSerial    bool `arg:"--test-serial" help:"Test the serial port connection and exit"`
-	TestTemp      bool `arg:"--test-temp" help:"Read and print the temperature from the ADC then exit"`
-	TestBatteryV  bool `arg:"--test-battery-voltage" help:"Read and print the battery voltage from the ADC then exit"`
-	TestCharge    bool `arg:"--test-charge" help:"Test that we can charge the battery"`
-	TestDischarge bool `arg:"--test-discharge" help:"Test that we can discharge the battery"`
-	TestOCD       bool `arg:"--test-ocd" help:"Test Over Current Detection (OCD)"`
-	TestSCD       bool `arg:"--test-scd" help:"Test Short Circuit Detection (SCD)"`
+	TestSerial     bool `arg:"--test-serial" help:"Test the serial port connection and exit"`
+	TestTemp       bool `arg:"--test-temp" help:"Read and print the temperature from the ADC then exit"`
+	TestBatteryV   bool `arg:"--test-battery-voltage" help:"Read and print the battery voltage from the ADC then exit"`
+	TestCharge     bool `arg:"--test-charge" help:"Test that we can charge the battery"`
+	TestDischarge  bool `arg:"--test-discharge" help:"Test that we can discharge the battery"`
+	TestOCD        bool `arg:"--test-ocd" help:"Test Over Current Detection (OCD)"`
+	TestSCD        bool `arg:"--test-scd" help:"Test Short Circuit Detection (SCD)"`
+	RunMonitorTest bool `arg:"--run-monitor-test" help:"Run the monitor test and exit"`
 
 	// Sequences
 	RunChargeSeq    bool `arg:"--run-charge-seq" help:"Run the charge sequence and exit"`
@@ -107,6 +113,11 @@ func runMain() error {
 			log.Errorf("Battery monitor error: %v", err)
 		}
 	}()
+
+	// Make data folder if it doesn't exist
+	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+		return fmt.Errorf("error creating data directory: %v", err)
+	}
 
 	// ==== Different Test Modes ====
 
@@ -186,37 +197,71 @@ func runMain() error {
 		return nil
 	}
 
+	// Run Charge Sequence
 	if args.RunChargeSeq {
-		return hw.runChargeSeq(battStateChan)
+		return hw.runChargeSeq(battStateChan, 0, "./")
 	}
 
+	// Run Discharge Sequence
+	if args.RunDischargeSeq {
+		return hw.runDischargeSeq(battStateChan, "./")
+	}
+
+	if args.RunMonitorTest {
+		return hw.runMonitorTest(battStateChan, "./")
+	}
+
+	// Run Full Test Sequence
 	results := &testResults{}
 
-	log.Println("=== Step 1: Charging battery ===")
-	if err := stepChargeBattery(hw, results); err != nil {
+	resultsDir := filepath.Join(dataDir, time.Now().Format("2006-01-02_15-04-05"))
+	if err := os.MkdirAll(resultsDir, 0o755); err != nil {
+		return fmt.Errorf("error creating results directory: %v", err)
+	}
+	log.Infof("Saving results to %s", resultsDir)
+
+	time.Sleep(time.Second)
+	log.Info("=== Step 1: Charging battery ===")
+	if err := hw.runChargeSeq(battStateChan, restVoltage, resultsDir); err != nil {
 		return fmt.Errorf("charge step failed: %v", err)
 	}
+	time.Sleep(time.Second)
 
 	log.Println("=== Step 2: Checking over-current discharge protection at 3A ===")
-	if err := stepCheckOverCurrentDischarge(hw, results); err != nil {
-		return fmt.Errorf("OCD test failed: %v", err)
+	pass, err := hw.overCurrentDischargeTest(battStateChan)
+	if err != nil {
+		return fmt.Errorf("OCD test errored: %v", err)
 	}
+	results.ocdPass = pass
+	time.Sleep(time.Second)
 
 	log.Println("=== Step 3: Checking short circuit protection ===")
-	if err := stepCheckShortCircuit(hw, results); err != nil {
-		return fmt.Errorf("short circuit test failed: %v", err)
+	pass, err = hw.testShortCircuit(battStateChan)
+	if err != nil {
+		return fmt.Errorf("short circuit test errored: %v", err)
 	}
+	results.shortCircuitPass = pass
+	time.Sleep(time.Second)
 
-	log.Println("=== Step 4: Discharging battery at 2.5A ===")
-	if err := stepDischargeBattery(hw, results); err != nil {
+	log.Println("=== Step 4: Discharging battery at 2A ===")
+	if err := hw.runDischargeSeq(battStateChan, resultsDir); err != nil {
 		return fmt.Errorf("discharge step failed: %v", err)
 	}
+	time.Sleep(time.Second)
 
-	log.Println("=== Step 5: Charging to 12V and monitoring for 24 hours ===")
-	if err := stepChargeAndMonitor(hw, results); err != nil {
-		return fmt.Errorf("charge and monitor step failed: %v", err)
+	log.Infof("=== Step 5: Charging to rest voltage (%.1fV) ===", restVoltage)
+	if err := hw.runChargeSeq(battStateChan, restVoltage, resultsDir); err != nil {
+		return fmt.Errorf("charge step failed: %v", err)
 	}
+	time.Sleep(time.Second)
 
+	log.Println("=== Step 6: Monitoring ===")
+	if err := hw.runMonitorTest(battStateChan, resultsDir); err != nil {
+		return fmt.Errorf("monitor step failed: %v", err)
+	}
+	time.Sleep(time.Second)
+
+	log.Println("=== Results ===")
 	results.print()
 	return nil
 }
