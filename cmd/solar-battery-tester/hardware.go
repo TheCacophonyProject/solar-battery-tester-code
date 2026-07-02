@@ -589,7 +589,7 @@ func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus, targetVoltage
 				return err
 			}
 
-			if time.Since(lastReportTime) > time.Minute {
+			if time.Since(lastReportTime) > logRate {
 				lastReportTime = time.Now()
 				log.Printf("Charging: %dmV %dmA", batteryState.VbatmV, batteryState.IbatmA)
 			}
@@ -633,11 +633,14 @@ func (hw *hardware) runMonitorTest(battStateChan chan BatteryStatus, dataDir str
 	}
 	defer cleanup()
 
-	duration := time.After(12 * time.Hour)
+	monitorDuration := 12 * time.Hour
+	monitorUntil := time.After(monitorDuration)
 	var lastReportTime time.Time
+
+	log.Infof("Starting monitoring sequence for %s", monitorDuration.String())
 	for {
 		select {
-		case <-duration:
+		case <-monitorUntil:
 			log.Info("Monitoring sequence finished.")
 			return nil
 		case batteryState := <-battStateChan:
@@ -647,7 +650,7 @@ func (hw *hardware) runMonitorTest(battStateChan chan BatteryStatus, dataDir str
 				return err
 			}
 
-			if time.Since(lastReportTime) > time.Minute {
+			if time.Since(lastReportTime) > logRate {
 				lastReportTime = time.Now()
 				log.Printf("Monitoring: %dmV %dmA", batteryState.VbatmV, batteryState.IbatmA)
 			}
@@ -699,9 +702,9 @@ func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir st
 				return err
 			}
 
-			if time.Since(lastReportTime) > time.Minute {
+			if time.Since(lastReportTime) > logRate {
 				lastReportTime = time.Now()
-				log.Printf("Discharging: %dmV %dmA", hardwareState.dischargeVoltage, hardwareState.dischargeCurrent)
+				log.Printf("Discharging: %.2fV %.2fA", hardwareState.dischargeVoltage, hardwareState.dischargeCurrent)
 			}
 
 			if hardwareState.dischargeVoltage < 1 {
