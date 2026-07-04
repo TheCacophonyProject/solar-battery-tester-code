@@ -554,7 +554,7 @@ func (hw *hardware) readSensors() *hardwareState {
 }
 
 // runChargeSeq will charge the battery to the target voltage. If you want to charge until the battery is fill leave targetVoltage = 0.
-func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus, targetVoltage float64, dataDir string) error {
+func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus, targetVoltage float64, dataDir, prefix string) error {
 	if targetVoltage == 0 {
 		log.Info("Running charge sequence until battery is full")
 	} else {
@@ -569,7 +569,7 @@ func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus, targetVoltage
 		return fmt.Errorf("setting CC loads: %v", err)
 	}
 
-	cleanupFunc, writer, err := makeStateCSVWriter(dataDir, "charging")
+	cleanupFunc, writer, err := makeStateCSVWriter(dataDir, prefix)
 	if err != nil {
 		return err
 	}
@@ -662,7 +662,7 @@ func (hw *hardware) runMonitorTest(battStateChan chan BatteryStatus, dataDir str
 	}
 }
 
-func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir string) error {
+func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir string, filePrefix string, ccLoads int) error {
 	log.Println("Waiting for battery status.")
 	<-battStateChan
 
@@ -672,11 +672,11 @@ func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir st
 	}
 
 	// Enable CC loads
-	if err := hw.setCCLoads(4); err != nil {
+	if err := hw.setCCLoads(ccLoads); err != nil {
 		return fmt.Errorf("setting CC loads: %v", err)
 	}
 
-	cleanup, writer, err := makeStateCSVWriter(dataDir, "discharge")
+	cleanup, writer, err := makeStateCSVWriter(dataDir, filePrefix)
 	if err != nil {
 		return err
 	}

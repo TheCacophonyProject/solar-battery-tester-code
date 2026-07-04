@@ -42,7 +42,7 @@ const (
 	chargeTimeoutDuration = 12 * time.Hour
 	dataDir               = "/var/lib/solar-battery-tester/data"
 	restVoltage           = 11.3
-	logRate               = 5 * time.Minute
+	logRate               = 30 * time.Minute
 )
 
 var log = logging.NewLogger("info")
@@ -200,12 +200,12 @@ func runMain() error {
 
 	// Run Charge Sequence
 	if args.RunChargeSeq {
-		return hw.runChargeSeq(battStateChan, 0, "./")
+		return hw.runChargeSeq(battStateChan, 0, "./", "charge")
 	}
 
 	// Run Discharge Sequence
 	if args.RunDischargeSeq {
-		return hw.runDischargeSeq(battStateChan, "./")
+		return hw.runDischargeSeq(battStateChan, "./", "discharge", 4)
 	}
 
 	if args.RunMonitorTest {
@@ -220,15 +220,24 @@ func runMain() error {
 		return fmt.Errorf("error creating results directory: %v", err)
 	}
 	log.Infof("Saving results to %s", resultsDir)
-
 	time.Sleep(time.Second)
-	log.Info("=== Step 1: Charging battery ===")
-	if err := hw.runChargeSeq(battStateChan, 0, resultsDir); err != nil {
+
+	step := 1
+	log.Infof("=== Step %d: Initial Battery Discharge ===", step)
+	if err := hw.runDischargeSeq(battStateChan, resultsDir, "initial_discharge", 2); err != nil {
 		return fmt.Errorf("charge step failed: %v", err)
 	}
 	time.Sleep(time.Second)
 
-	log.Println("=== Step 2: Checking over-current discharge protection at 3A ===")
+	step++
+	log.Infof("=== Step %d: Full Battery Charge ===", step)
+	if err := hw.runChargeSeq(battStateChan, 0, resultsDir, "full_charge"); err != nil {
+		return fmt.Errorf("charge step failed: %v", err)
+	}
+	time.Sleep(time.Second)
+
+	step++
+	log.Infof("=== Step %d: Checking over-current discharge protection at 3A ===", step)
 	pass, err := hw.overCurrentDischargeTest(battStateChan)
 	if err != nil {
 		return fmt.Errorf("OCD test errored: %v", err)
@@ -236,7 +245,8 @@ func runMain() error {
 	results.ocdPass = pass
 	time.Sleep(time.Second)
 
-	log.Println("=== Step 3: Checking short circuit protection ===")
+	step++
+	log.Infof("=== Step %d: Checking short circuit protection ===", step)
 	pass, err = hw.testShortCircuit(battStateChan)
 	if err != nil {
 		return fmt.Errorf("short circuit test errored: %v", err)
@@ -244,19 +254,22 @@ func runMain() error {
 	results.shortCircuitPass = pass
 	time.Sleep(time.Second)
 
-	log.Println("=== Step 4: Discharging battery at 2A ===")
-	if err := hw.runDischargeSeq(battStateChan, resultsDir); err != nil {
+	step++
+	log.Infof("=== Step %d: Discharging battery at 2A ===", step)
+	if err := hw.runDischargeSeq(battStateChan, resultsDir, "full_discharge", 4); err != nil {
 		return fmt.Errorf("discharge step failed: %v", err)
 	}
 	time.Sleep(time.Second)
 
-	log.Infof("=== Step 5: Charging to rest voltage (%.1fV) ===", restVoltage)
-	if err := hw.runChargeSeq(battStateChan, restVoltage, resultsDir); err != nil {
+	step++
+	log.Infof("=== Step %d: Charging to rest voltage (%.1fV) ===", step, restVoltage)
+	if err := hw.runChargeSeq(battStateChan, restVoltage, resultsDir, "rest_charge"); err != nil {
 		return fmt.Errorf("charge step failed: %v", err)
 	}
 	time.Sleep(time.Second)
 
-	log.Println("=== Step 6: Monitoring ===")
+	step++
+	log.Infof("=== Step %d: Monitoring ===", step)
 	if err := hw.runMonitorTest(battStateChan, resultsDir); err != nil {
 		return fmt.Errorf("monitor step failed: %v", err)
 	}
@@ -264,190 +277,6 @@ func runMain() error {
 
 	log.Println("=== Results ===")
 	results.print()
-	return nil
-}
-
-func stepChargeBattery(hw *hardware, results *testResults) error {
-	if err := hw.setChargeEnable(true); err != nil {
-		return err
-	}
-	defer hw.setChargeEnable(false)
-
-	log.Printf("Charging battery to %.1fV...", chargeTargetVoltage)
-	start := time.Now()
-	for {
-		v, i, err := hw.readChargeMonitor()
-		if err != nil {
-			return fmt.Errorf("reading charge monitor: %v", err)
-		}
-		battV, err := hw.readBatteryVoltage()
-		if err != nil {
-			return fmt.Errorf("reading battery voltage: %v", err)
-		}
-		log.Printf("Charging: bus=%.3fV shunt=%.3fA battery=%.3fV elapsed=%s", v, i, battV, time.Since(start).Round(time.Second))
-
-		if battV >= chargeTargetVoltage && i < chargeCutoffCurrent {
-			log.Printf("Battery fully charged: %.3fV in %s", battV, time.Since(start).Round(time.Second))
-			results.chargeTime = time.Since(start)
-			results.chargeVoltage = battV
-			break
-		}
-		time.Sleep(logInterval)
-	}
-	return nil
-}
-
-func stepCheckOverCurrentDischarge(hw *hardware, results *testResults) error {
-	if err := hw.setChargeEnable(false); err != nil {
-		return err
-	}
-
-	log.Println("Enabling all 6 CC loads (expected ~3A to trigger OCD protection)...")
-	if err := hw.setCCLoads(6); err != nil {
-		return err
-	}
-	defer hw.setCCLoads(0)
-
-	time.Sleep(500 * time.Millisecond)
-
-	deadline := time.Now().Add(ocdTestTimeout)
-	for time.Now().Before(deadline) {
-		v, i, err := hw.readDischargeMonitor()
-		if err != nil {
-			return fmt.Errorf("reading discharge monitor: %v", err)
-		}
-		log.Printf("OCD test: bus=%.3fV current=%.3fA", v, i)
-		if i < 0.1 && v < 0.5 {
-			log.Println("OCD protection triggered - PASS")
-			results.ocdPass = true
-			return nil
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-
-	log.Println("OCD protection did NOT trigger within timeout - FAIL")
-	results.ocdPass = false
-	return nil
-}
-
-func stepCheckShortCircuit(hw *hardware, results *testResults) error {
-	log.Println("Triggering short circuit...")
-	if err := hw.setShortCircuit(true); err != nil {
-		return err
-	}
-	defer hw.setShortCircuit(false)
-
-	time.Sleep(500 * time.Millisecond)
-
-	deadline := time.Now().Add(shortCircuitTimeout)
-	for time.Now().Before(deadline) {
-		v, i, err := hw.readDischargeMonitor()
-		if err != nil {
-			return fmt.Errorf("reading discharge monitor: %v", err)
-		}
-		log.Printf("Short circuit test: bus=%.3fV current=%.3fA", v, i)
-		if i < 0.1 && v < 0.5 {
-			log.Println("Short circuit protection triggered - PASS")
-			results.shortCircuitPass = true
-			return nil
-		}
-		time.Sleep(100 * time.Millisecond)
-	}
-
-	log.Println("Short circuit protection did NOT trigger within timeout - FAIL")
-	results.shortCircuitPass = false
-	return nil
-}
-
-func stepDischargeBattery(hw *hardware, results *testResults) error {
-	log.Println("Enabling 5 CC loads for 2.5A discharge...")
-	if err := hw.setCCLoads(5); err != nil {
-		return err
-	}
-	defer hw.setCCLoads(0)
-
-	start := time.Now()
-	for {
-		v, i, err := hw.readDischargeMonitor()
-		if err != nil {
-			return fmt.Errorf("reading discharge monitor: %v", err)
-		}
-		battV, err := hw.readBatteryVoltage()
-		if err != nil {
-			return fmt.Errorf("reading battery voltage: %v", err)
-		}
-		tempC, err := hw.readTemperature()
-		if err != nil {
-			return fmt.Errorf("reading temperature: %v", err)
-		}
-		log.Printf("Discharging: bus=%.3fV current=%.3fA battery=%.3fV temp=%.1f°C elapsed=%s", v, i, battV, tempC, time.Since(start).Round(time.Second))
-
-		if tempC >= dischargeTempLimitC {
-			log.Printf("Temperature %.1f°C exceeded limit of %.0f°C, stopping discharge", tempC, dischargeTempLimitC)
-			results.dischargeTime = time.Since(start)
-			results.dischargeEndVoltage = battV
-			results.dischargeTempTripped = true
-			break
-		}
-		if battV <= dischargeMinVoltage {
-			log.Printf("Battery discharged to %.3fV in %s", battV, time.Since(start).Round(time.Second))
-			results.dischargeTime = time.Since(start)
-			results.dischargeEndVoltage = battV
-			break
-		}
-		// Battery protection tripped
-		if i < 0.1 && v < 0.5 {
-			log.Printf("Battery protection tripped at %.3fV after %s", battV, time.Since(start).Round(time.Second))
-			results.dischargeTime = time.Since(start)
-			results.dischargeEndVoltage = battV
-			break
-		}
-		time.Sleep(logInterval)
-	}
-	return nil
-}
-
-func stepChargeAndMonitor(hw *hardware, results *testResults) error {
-	if err := hw.setChargeEnable(true); err != nil {
-		return err
-	}
-	defer hw.setChargeEnable(false)
-
-	log.Printf("Charging to %.1fV...", chargeTargetVoltage)
-	for {
-		battV, err := hw.readBatteryVoltage()
-		if err != nil {
-			return fmt.Errorf("reading battery voltage: %v", err)
-		}
-		_, i, err := hw.readChargeMonitor()
-		if err != nil {
-			return fmt.Errorf("reading charge monitor: %v", err)
-		}
-		log.Printf("Charging: battery=%.3fV current=%.3fA", battV, i)
-		if battV >= chargeTargetVoltage {
-			log.Printf("Reached %.1fV, starting 24h voltage monitoring", chargeTargetVoltage)
-			break
-		}
-		time.Sleep(logInterval)
-	}
-
-	log.Println("Monitoring voltage for 24 hours...")
-	start := time.Now()
-	end := start.Add(chargeMonitorDuration)
-	for time.Now().Before(end) {
-		battV, err := hw.readBatteryVoltage()
-		if err != nil {
-			return fmt.Errorf("reading battery voltage: %v", err)
-		}
-		elapsed := time.Since(start).Round(time.Second)
-		remaining := time.Until(end).Round(time.Second)
-		log.Printf("Monitor: battery=%.3fV elapsed=%s remaining=%s", battV, elapsed, remaining)
-		results.monitorReadings = append(results.monitorReadings, voltageReading{
-			time:    time.Now(),
-			voltage: battV,
-		})
-		time.Sleep(chargeMonitorInterval)
-	}
 	return nil
 }
 
