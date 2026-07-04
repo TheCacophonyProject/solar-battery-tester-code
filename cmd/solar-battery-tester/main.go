@@ -30,19 +30,11 @@ import (
 )
 
 const (
-	chargeTargetVoltage   = 12.6 // V - full charge target
-	chargeCutoffCurrent   = 0.1  // A - stop charging below this current
-	dischargeMinVoltage   = 9.0  // V - stop discharging below this voltage
 	dischargeTempLimitC   = 80.0 // °C - stop discharging above this temperature
-	ocdTestTimeout        = 5 * time.Second
-	shortCircuitTimeout   = 2 * time.Second
-	chargeMonitorInterval = 5 * time.Minute
-	chargeMonitorDuration = 10 * time.Minute
-	logInterval           = 10 * time.Second
 	chargeTimeoutDuration = 12 * time.Hour
 	dataDir               = "/var/lib/solar-battery-tester/data"
 	restVoltage           = 11.3
-	logRate               = 30 * time.Minute
+	logRate               = 5 * time.Minute
 )
 
 var log = logging.NewLogger("info")
