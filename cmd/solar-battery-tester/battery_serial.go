@@ -152,7 +152,25 @@ const (
 	batteryBaudRate         = 9600
 	batteryStatusCode       = 0x90
 	batteryStatusPayloadLen = 36 // bytes following the 0x90 code byte
+	batteryStatusCRCLen     = 2  // CRC-16 trailing the payload (little-endian)
 )
+
+// crc16CCITT computes CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no
+// reflection). Must match crc16CCITT() in the firmware (util.h).
+func crc16CCITT(data []byte) uint16 {
+	crc := uint16(0xFFFF)
+	for _, b := range data {
+		crc ^= uint16(b) << 8
+		for i := 0; i < 8; i++ {
+			if crc&0x8000 != 0 {
+				crc = (crc << 1) ^ 0x1021
+			} else {
+				crc <<= 1
+			}
+		}
+	}
+	return crc
+}
 
 // runBatteryMonitor reads and prints battery status messages in a loop until interrupted,
 // writing each parsed status into ch.
@@ -225,20 +243,39 @@ func readBatteryStatus(port *serial.Port, timeout time.Duration) (*BatteryStatus
 		}
 
 		payload := make([]byte, batteryStatusPayloadLen)
-		total := 0
-		for total < batteryStatusPayloadLen {
-			if time.Now().After(deadline) {
-				return nil, fmt.Errorf("timeout reading payload (%d/%d bytes)", total, batteryStatusPayloadLen)
-			}
-			n, err := port.Read(payload[total:])
-			if err != nil {
-				return nil, fmt.Errorf("reading payload: %v", err)
-			}
-			total += n
+		if err := readFull(port, payload, deadline); err != nil {
+			return nil, fmt.Errorf("reading payload: %v", err)
+		}
+
+		crcBytes := make([]byte, batteryStatusCRCLen)
+		if err := readFull(port, crcBytes, deadline); err != nil {
+			return nil, fmt.Errorf("reading CRC: %v", err)
+		}
+		want := binary.LittleEndian.Uint16(crcBytes)
+		if got := crc16CCITT(payload); got != want {
+			// Corrupt bytes or a 0x90 that was actually mid-payload data:
+			// drop this frame and resync on the next 0x90.
+			return nil, fmt.Errorf("CRC mismatch: got %#04x want %#04x", got, want)
 		}
 		return parseStatusPayload(payload)
 	}
 	return nil, fmt.Errorf("timeout waiting for battery 0x90 status message")
+}
+
+// readFull reads exactly len(buf) bytes from port, honoring deadline.
+func readFull(port *serial.Port, buf []byte, deadline time.Time) error {
+	total := 0
+	for total < len(buf) {
+		if time.Now().After(deadline) {
+			return fmt.Errorf("timeout (%d/%d bytes)", total, len(buf))
+		}
+		n, err := port.Read(buf[total:])
+		if err != nil {
+			return err
+		}
+		total += n
+	}
+	return nil
 }
 
 // parseStatusPayload decodes the 36-byte 0x90 payload into a BatteryStatus.
