@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/csv"
+	"errors"
 	"fmt"
 	"math"
 	"math/rand"
@@ -19,20 +20,21 @@ import (
 
 // GPIO pin assignments from schematic (solar-battery-tester.kicad_sch).
 const (
-	pinChargeEn            = "GPIO17"
-	pinEnShort             = "GPIO5"
-	pinEnFan               = "GPIO4"
-	pinBatterySenseDigital = "GPIO7"
-	pinAdcReady            = "GPIO27"
-	pinLedR                = "GPIO25"
-	pinLedG                = "GPIO24"
-	pinLedB                = "GPIO23"
-	pinCCLoad1             = "GPIO21"
-	pinCCLoad2             = "GPIO20"
-	pinCCLoad3             = "GPIO26"
-	pinCCLoad4             = "GPIO16"
-	pinCCLoad5             = "GPIO19"
-	pinCCLoad6             = "GPIO6"
+	pinChargeEn = "GPIO17"
+	pinEnShort  = "GPIO12"
+	pinEnFan    = "GPIO4"
+	// pinBatterySenseDigital = "GPIO7"
+	// pinAdcReady = "GPIO27"
+	pinLedR = "GPIO6"
+	pinLedG = "GPIO5"
+	pinLedB = "GPIO7"
+
+	pinCCLoad1 = "GPIO21"
+	pinCCLoad2 = "GPIO26"
+	pinCCLoad3 = "GPIO20"
+	pinCCLoad4 = "GPIO19"
+	pinCCLoad5 = "GPIO16"
+	pinCCLoad6 = "GPIO13"
 )
 
 // Shunt resistance on the solar-battery-tester PCB (R412 for charge, R420 for discharge).
@@ -60,6 +62,7 @@ type hardware struct {
 	ledG                gpio.PinOut
 	ledB                gpio.PinOut
 	ccLoads             [6]gpio.PinOut
+	ledChan             chan [3]led
 
 	chargeMonitor    *INA219
 	dischargeMonitor *INA219
@@ -102,23 +105,20 @@ func newHardware() (*hardware, error) {
 		*pd.pin = p
 	}
 
-	inputPinDefs := []struct {
-		name string
-		pin  *gpio.PinIn
-	}{
-		{pinBatterySenseDigital, &hw.batterySenseDigital},
-		{pinAdcReady, &hw.adcReady},
-	}
-	for _, pd := range inputPinDefs {
-		p := gpioreg.ByName(pd.name)
-		if p == nil {
-			return nil, fmt.Errorf("GPIO pin %s not found", pd.name)
-		}
-		if err := p.In(gpio.Float, gpio.NoEdge); err != nil {
-			return nil, fmt.Errorf("set %s as input: %v", pd.name, err)
-		}
-		*pd.pin = p
-	}
+	// inputPinDefs := []struct {
+	// 	name string
+	// 	pin  *gpio.PinIn
+	// }{}
+	// for _, pd := range inputPinDefs {
+	// 	p := gpioreg.ByName(pd.name)
+	// 	if p == nil {
+	// 		return nil, fmt.Errorf("GPIO pin %s not found", pd.name)
+	// 	}
+	// 	if err := p.In(gpio.Float, gpio.NoEdge); err != nil {
+	// 		return nil, fmt.Errorf("set %s as input: %v", pd.name, err)
+	// 	}
+	// 	*pd.pin = p
+	// }
 
 	hw.chargeMonitor = &INA219{dev: &i2c.Dev{Bus: bus, Addr: i2cAddrINA219Charge}, ShuntOhms: pcbShuntOhms}
 	if err := hw.chargeMonitor.init(); err != nil {
@@ -132,6 +132,9 @@ func newHardware() (*hardware, error) {
 
 	hw.adc = &ADS1115{dev: &i2c.Dev{Bus: bus, Addr: i2cAddrADS1115}}
 
+	hw.ledChan = make(chan [3]led)
+	go ledHandler(hw, hw.ledChan)
+
 	return hw, nil
 }
 
@@ -139,8 +142,9 @@ func (hw *hardware) close() {
 	hw.setChargeEnable(false)
 	hw.setShortCircuit(false)
 	hw.setCCLoads(0)
-	hw.setLED(false, false, false)
+	hw.setLEDs(led{}, led{}, led{})
 	hw.bus.Close()
+	time.Sleep(100 * time.Millisecond)
 }
 
 func (hw *hardware) setChargeEnable(enable bool) error {
@@ -160,14 +164,84 @@ func (hw *hardware) setFan(enable bool) error {
 	return hw.enFan.Out(gpioLevel(enable))
 }
 
-func (hw *hardware) setLED(r, g, b bool) error {
-	if err := hw.ledR.Out(gpioLevel(r)); err != nil {
-		return err
+type led struct {
+	on     bool          // If the LED should be on or off
+	period time.Duration // Set period to 0 for solid, non 0 for flashing
+}
+
+// setLEDs sends the desired r, g, b state to ledHandler for it to apply.
+func (hw *hardware) setLEDs(r, g, b led) {
+	hw.ledChan <- [3]led{r, g, b}
+}
+
+func (hw *hardware) solidLED(r, g, b bool) {
+	hw.ledChan <- [3]led{{on: r}, {on: g}, {on: b}}
+}
+
+// Give the period in milliseconds.
+func (hw *hardware) flashLED(r, g, b int) {
+	hw.ledChan <- [3]led{
+		{on: r > 0, period: time.Duration(r) * time.Millisecond},
+		{on: g > 0, period: time.Duration(g) * time.Millisecond},
+		{on: b > 0, period: time.Duration(b) * time.Millisecond},
 	}
-	if err := hw.ledG.Out(gpioLevel(g)); err != nil {
-		return err
+}
+
+// ledHandler owns the physical LED state. It applies whatever [3]led state is
+// sent on channel, and if one of the colors is flashing, toggles it on the
+// requested period. Only one color is expected to be flashing at a time.
+func ledHandler(hw *hardware, channel chan [3]led) {
+	var current [3]led
+	var ticker *time.Ticker
+	var tick <-chan time.Time
+	on := true
+
+	// LED GPIOs are active-low: driving the pin LOW turns the LED on.
+	apply := func() {
+		r, g, b := current[0].on && on, current[1].on && on, current[2].on && on
+		log.Infof("Setting LED: %v %v %v", r, g, b)
+		if err := hw.ledR.Out(gpioLevel(!r)); err != nil {
+			log.Warnf("Setting LED: %v", err)
+		}
+		if err := hw.ledG.Out(gpioLevel(!g)); err != nil {
+			log.Warnf("Setting LED: %v", err)
+		}
+		if err := hw.ledB.Out(gpioLevel(!b)); err != nil {
+			log.Warnf("Setting LED: %v", err)
+		}
 	}
-	return hw.ledB.Out(gpioLevel(b))
+
+	// A nil tick channel blocks forever, so the flash case is simply
+	// inert until a flashing color starts a ticker.
+	for {
+		select {
+		case rgb := <-channel:
+			if ticker != nil {
+				ticker.Stop()
+				ticker = nil
+				tick = nil
+			}
+			current = rgb
+			on = true
+			apply()
+
+			period := time.Duration(0)
+			for _, l := range current {
+				if l.period != 0 {
+					period = l.period
+					break
+				}
+			}
+			if period != 0 {
+				ticker = time.NewTicker(period)
+				tick = ticker.C
+			}
+
+		case <-tick:
+			on = !on
+			apply()
+		}
+	}
 }
 
 // setCCLoads enables `count` randomly-selected CC loads (0–6) and controls the fan.
@@ -554,7 +628,7 @@ func (hw *hardware) readSensors() *hardwareState {
 }
 
 // runChargeSeq will charge the battery to the target voltage. If you want to charge until the battery is fill leave targetVoltage = 0.
-func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus, targetVoltage float64, dataDir, prefix string) error {
+func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus, targetVoltage float64, dataDir, prefix string, quickTest bool) error {
 	if targetVoltage == 0 {
 		log.Info("Running charge sequence until battery is full")
 	} else {
@@ -564,6 +638,11 @@ func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus, targetVoltage
 	if err := hw.setChargeEnable(true); err != nil {
 		return fmt.Errorf("setting charge enable: %v", err)
 	}
+	defer func() {
+		if err := hw.setChargeEnable(false); err != nil {
+			log.Errorf("setting charge enable: %v", err)
+		}
+	}()
 
 	if err := hw.setCCLoads(0); err != nil {
 		return fmt.Errorf("setting CC loads: %v", err)
@@ -576,10 +655,17 @@ func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus, targetVoltage
 	defer cleanupFunc()
 
 	timeout := time.After(chargeTimeoutDuration)
+	if quickTest {
+		timeout = time.After(5 * time.Minute)
+	}
 	var lastReportTime time.Time
 	for {
 		select {
 		case <-timeout:
+			if quickTest {
+				log.Info("Exiting charge sequence early for quick test.")
+				return nil
+			}
 			return fmt.Errorf("charge sequence timed out after %s", chargeTimeoutDuration)
 		case batteryState := <-battStateChan:
 
@@ -616,7 +702,7 @@ func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus, targetVoltage
 	}
 }
 
-func (hw *hardware) runMonitorTest(battStateChan chan BatteryStatus, dataDir string) error {
+func (hw *hardware) runMonitorTest(battStateChan chan BatteryStatus, dataDir string, quickTest bool) error {
 	// Disable charging
 	if err := hw.setChargeEnable(false); err != nil {
 		return fmt.Errorf("setting charge enable: %v", err)
@@ -634,6 +720,10 @@ func (hw *hardware) runMonitorTest(battStateChan chan BatteryStatus, dataDir str
 	defer cleanup()
 
 	monitorDuration := 12 * time.Hour
+	if quickTest {
+		monitorDuration = 5 * time.Minute
+	}
+
 	monitorUntil := time.After(monitorDuration)
 	var lastReportTime time.Time
 
@@ -641,6 +731,10 @@ func (hw *hardware) runMonitorTest(battStateChan chan BatteryStatus, dataDir str
 	for {
 		select {
 		case <-monitorUntil:
+			if quickTest {
+				log.Info("Exiting monitoring sequence early for quick test.")
+				return nil
+			}
 			log.Info("Monitoring sequence finished.")
 			return nil
 		case batteryState := <-battStateChan:
@@ -662,7 +756,66 @@ func (hw *hardware) runMonitorTest(battStateChan chan BatteryStatus, dataDir str
 	}
 }
 
-func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir string, filePrefix string, ccLoads int) error {
+func (hw *hardware) waitForCellsToBalance(battStateChan chan BatteryStatus, dataDir string, quickTets bool) error {
+	log.Println("Waiting for cells to balance.")
+	<-battStateChan
+
+	// Disable charging
+	if err := hw.setChargeEnable(false); err != nil {
+		return fmt.Errorf("setting charge enable: %v", err)
+	}
+
+	// Disable CC loads
+	if err := hw.setCCLoads(0); err != nil {
+		return fmt.Errorf("setting CC loads: %v", err)
+	}
+
+	csvCleanup, writer, err := makeStateCSVWriter(dataDir, "balancing")
+	if err != nil {
+		return err
+	}
+	defer csvCleanup()
+
+	timeout := time.After(24 * time.Hour)
+	if quickTets {
+		timeout = time.After(5 * time.Minute)
+	}
+	var lastReportTime time.Time
+	for {
+		select {
+		case <-timeout:
+			if quickTets {
+				log.Info("Exiting balancing sequence early for quick test.")
+				return nil
+			}
+			return fmt.Errorf("balance sequence timed out after 24 hours")
+		case <-time.After(time.Minute):
+			log.Info("Message taking too long, something is wrong.")
+			return errors.New("No more messages from battery")
+		case batteryState := <-battStateChan:
+
+			hardwareState := hw.readSensors()
+			if err := writeCSVState(hardwareState, batteryState, writer); err != nil {
+				return err
+			}
+
+			// TODO: Wait until all the cells are all balanced
+
+			chargerReg := batteryState.BQStat[1]
+			if (chargerReg & 0x1F) == 0 {
+				log.Info("All cells are balanced.")
+				return nil
+			}
+
+			if time.Since(lastReportTime) > logRate {
+				lastReportTime = time.Now()
+				log.Printf("Discharging: %.2fV %.2fA", hardwareState.dischargeVoltage, hardwareState.dischargeCurrent)
+			}
+		}
+	}
+}
+
+func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir string, filePrefix string, ccLoads int, quickTest bool) error {
 	log.Println("Waiting for battery status.")
 	<-battStateChan
 
@@ -675,6 +828,11 @@ func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir st
 	if err := hw.setCCLoads(ccLoads); err != nil {
 		return fmt.Errorf("setting CC loads: %v", err)
 	}
+	defer func() {
+		if err := hw.setCCLoads(0); err != nil {
+			log.Errorf("setting CC loads: %v", err)
+		}
+	}()
 
 	cleanup, writer, err := makeStateCSVWriter(dataDir, filePrefix)
 	if err != nil {
@@ -683,11 +841,18 @@ func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir st
 	defer cleanup()
 
 	timeout := time.After(12 * time.Hour)
+	if quickTest {
+		timeout = time.After(5 * time.Minute)
+	}
 	var lastReportTime time.Time
 	lastVoltageReading := 0.0
 	for {
 		select {
 		case <-timeout:
+			if quickTest {
+				log.Info("Exiting discharge sequence early for quick test.")
+				return nil
+			}
 			return fmt.Errorf("charge sequence timed out after 12 hours")
 		case <-time.After(30 * time.Second):
 			log.Info("Message taking too long, checking if battery has discharged.")

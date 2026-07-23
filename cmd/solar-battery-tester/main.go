@@ -24,15 +24,13 @@ import (
 
 	"github.com/TheCacophonyProject/go-utils/logging"
 	arg "github.com/alexflint/go-arg"
-	"periph.io/x/conn/v3/gpio"
-	"periph.io/x/conn/v3/gpio/gpioreg"
 	"periph.io/x/host/v3"
 )
 
 const (
 	dischargeTempLimitC   = 80.0 // °C - stop discharging above this temperature
 	chargeTimeoutDuration = 12 * time.Hour
-	dataDir               = "/var/lib/solar-battery-tester/data"
+	testDataDir           = "/var/lib/solar-battery-tester/data"
 	restVoltage           = 11.3
 	logRate               = 5 * time.Minute
 )
@@ -52,6 +50,9 @@ type Args struct {
 	TestOCD        bool `arg:"--test-ocd" help:"Test Over Current Detection (OCD)"`
 	TestSCD        bool `arg:"--test-scd" help:"Test Short Circuit Detection (SCD)"`
 	RunMonitorTest bool `arg:"--run-monitor-test" help:"Run the monitor test and exit"`
+	RunFullTests   bool `arg:"--run-full-test" help:"Loop through running the full test sequence."`
+
+	QuickTest bool `arg:"--quick-test" help:"option for run full test sequqnce where each test will last as long as 5 minutes"`
 
 	// Sequences
 	RunChargeSeq    bool `arg:"--run-charge-seq" help:"Run the charge sequence and exit"`
@@ -83,15 +84,6 @@ func runMain() error {
 		return fmt.Errorf("failed to initialize periph: %v", err)
 	}
 
-	// GPIO7 is wired up but is no longer used so we put in a high impedance input.
-	gpio7 := gpioreg.ByName(pinBatterySenseDigital)
-	if gpio7 == nil {
-		return fmt.Errorf("GPIO pin %s not found", pinBatterySenseDigital)
-	}
-	if err := gpio7.In(gpio.Float, gpio.NoEdge); err != nil {
-		return fmt.Errorf("set %s as high-impedance input: %v", pinBatterySenseDigital, err)
-	}
-
 	// Initialize hardware
 	hw, err := newHardware()
 	if err != nil {
@@ -108,7 +100,7 @@ func runMain() error {
 	}()
 
 	// Make data folder if it doesn't exist
-	if err := os.MkdirAll(dataDir, 0o755); err != nil {
+	if err := os.MkdirAll(testDataDir, 0o755); err != nil {
 		return fmt.Errorf("error creating data directory: %v", err)
 	}
 
@@ -192,38 +184,79 @@ func runMain() error {
 
 	// Run Charge Sequence
 	if args.RunChargeSeq {
-		return hw.runChargeSeq(battStateChan, 0, "./", "charge")
+		return hw.runChargeSeq(battStateChan, 0, "./", "charge", false)
 	}
 
 	// Run Discharge Sequence
 	if args.RunDischargeSeq {
-		return hw.runDischargeSeq(battStateChan, "./", "discharge", 4)
+		return hw.runDischargeSeq(battStateChan, "./", "discharge", 4, false)
 	}
 
 	if args.RunMonitorTest {
-		return hw.runMonitorTest(battStateChan, "./")
+		return hw.runMonitorTest(battStateChan, "./", false)
 	}
 
-	// Run Full Test Sequence
+	if args.RunFullTests {
+		for {
+			err := runFullTest(hw, battStateChan, args.QuickTest)
+			if err != nil {
+				log.Errorf("full test failed/errored: %v", err)
+				hw.flashLED(200, 0, 0)
+				time.Sleep(5 * time.Second)
+			}
+		}
+	}
+
+	return nil
+}
+
+func runFullTest(hw *hardware, battStateChan chan BatteryStatus, quickTest bool) error {
+	log.Info("=== Full Test Sequence Setup ===\n\n")
+	hw.solidLED(true, false, false)
+
+	log.Info("=== Waiting for USB device to be connected. ===")
+	usbMountPath, err := waitForUSBDrive()
+	if err != nil {
+		return fmt.Errorf("waiting for USB device: %v", err)
+	}
+	log.Infof("Found USB device, mounted at %s.\n\n", usbMountPath)
+	hw.flashLED(1000, 0, 0)
+
+	log.Info("=== Waiting for battery to be plugged in ===")
+	batteryState := <-battStateChan
+	log.Infof("Battery detected: %s\n\n", batteryState)
+	hw.flashLED(0, 1000, 0)
+
+	log.Info("=== Running Full Test Sequence ===\n\n")
+
 	results := &testResults{}
 
-	resultsDir := filepath.Join(dataDir, time.Now().Format("2006-01-02_15-04-05"))
+	resultsFolderName := fmt.Sprintf("Battery_%d___Time_%s", batteryState.BatteryID, time.Now().Format("2006-01-02_15-04-05"))
+
+	resultsDir := filepath.Join(usbMountPath, resultsFolderName)
 	if err := os.MkdirAll(resultsDir, 0o755); err != nil {
 		return fmt.Errorf("error creating results directory: %v", err)
 	}
-	log.Infof("Saving results to %s", resultsDir)
+	log.Infof("Saving results to: %s", resultsDir)
 	time.Sleep(time.Second)
 
 	step := 1
+	log.Infof("=== Step %d: Waiting for cells to be balanced ===", step)
+	if err := hw.waitForCellsToBalance(battStateChan, resultsDir, quickTest); err != nil {
+		return fmt.Errorf("error waiting for cells to balance: %v", err)
+	}
+	time.Sleep(time.Second)
+
+	step++
 	log.Infof("=== Step %d: Initial Battery Discharge ===", step)
-	if err := hw.runDischargeSeq(battStateChan, resultsDir, "initial_discharge", 2); err != nil {
+	if err := hw.runDischargeSeq(battStateChan, resultsDir, "initial_discharge", 2, quickTest); err != nil {
 		return fmt.Errorf("charge step failed: %v", err)
 	}
 	time.Sleep(time.Second)
 
 	step++
 	log.Infof("=== Step %d: Full Battery Charge ===", step)
-	if err := hw.runChargeSeq(battStateChan, 0, resultsDir, "full_charge"); err != nil {
+	if err := hw.runChargeSeq(battStateChan, 0, resultsDir, "full_charge", quickTest); err != nil {
 		return fmt.Errorf("charge step failed: %v", err)
 	}
 	time.Sleep(time.Second)
@@ -248,21 +281,21 @@ func runMain() error {
 
 	step++
 	log.Infof("=== Step %d: Discharging battery at 2A ===", step)
-	if err := hw.runDischargeSeq(battStateChan, resultsDir, "full_discharge", 4); err != nil {
+	if err := hw.runDischargeSeq(battStateChan, resultsDir, "full_discharge", 4, quickTest); err != nil {
 		return fmt.Errorf("discharge step failed: %v", err)
 	}
 	time.Sleep(time.Second)
 
 	step++
 	log.Infof("=== Step %d: Charging to rest voltage (%.1fV) ===", step, restVoltage)
-	if err := hw.runChargeSeq(battStateChan, restVoltage, resultsDir, "rest_charge"); err != nil {
+	if err := hw.runChargeSeq(battStateChan, restVoltage, resultsDir, "rest_charge", quickTest); err != nil {
 		return fmt.Errorf("charge step failed: %v", err)
 	}
 	time.Sleep(time.Second)
 
 	step++
 	log.Infof("=== Step %d: Monitoring ===", step)
-	if err := hw.runMonitorTest(battStateChan, resultsDir); err != nil {
+	if err := hw.runMonitorTest(battStateChan, resultsDir, quickTest); err != nil {
 		return fmt.Errorf("monitor step failed: %v", err)
 	}
 	time.Sleep(time.Second)
