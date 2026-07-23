@@ -150,7 +150,7 @@ func (s *BatteryStatus) BQFaults() []string {
 }
 
 const (
-	batteryBaudRate         = 2400
+	batteryBaudRate         = 9600
 	batteryStatusCode       = 0x90
 	batteryStatusPayloadLen = 38 // bytes following the 0x90 code byte
 	batteryStatusCRCLen     = 2  // CRC-16 trailing the payload (little-endian)

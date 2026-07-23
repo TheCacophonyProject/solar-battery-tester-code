@@ -32,7 +32,7 @@ const (
 	chargeTimeoutDuration = 12 * time.Hour
 	testDataDir           = "/var/lib/solar-battery-tester/data"
 	restVoltage           = 11.3
-	logRate               = 5 * time.Minute
+	logRate               = 20 * time.Minute
 )
 
 var log = logging.NewLogger("info")
@@ -41,25 +41,31 @@ var version = "No version provided"
 type Args struct {
 	BatterySerial string `arg:"--battery-serial" default:"/dev/serial0" help:"Serial device for battery UART"`
 
-	// Tests
-	TestSerial     bool `arg:"--test-serial" help:"Test the serial port connection and exit"`
-	TestTemp       bool `arg:"--test-temp" help:"Read and print the temperature from the ADC then exit"`
-	TestBatteryV   bool `arg:"--test-battery-voltage" help:"Read and print the battery voltage from the ADC then exit"`
-	TestCharge     bool `arg:"--test-charge" help:"Test that we can charge the battery"`
-	TestDischarge  bool `arg:"--test-discharge" help:"Test that we can discharge the battery"`
-	TestOCD        bool `arg:"--test-ocd" help:"Test Over Current Detection (OCD)"`
-	TestSCD        bool `arg:"--test-scd" help:"Test Short Circuit Detection (SCD)"`
-	RunMonitorTest bool `arg:"--run-monitor-test" help:"Run the monitor test and exit"`
-	RunFullTests   bool `arg:"--run-full-test" help:"Loop through running the full test sequence."`
-
-	QuickTest bool `arg:"--quick-test" help:"option for run full test sequqnce where each test will last as long as 5 minutes"`
+	// Unit Tests
+	TestSerial *subcommand `arg:"subcommand:test-serial" help:"Test the serial port connection and exit"`
+	TestADC    *subcommand `arg:"subcommand:test-adc" help:"Read and print the values from the ADC"`
+	// TestCharge    *subcommand `arg:"subcommand:test-charge" help:"Test that we can charge the battery"`
+	// TestDischarge *subcommand `arg:"subcommand:test-discharge" help:"Test that we can discharge the battery"`
+	TestOCD *subcommand `arg:"subcommand:test-ocd" help:"Test Over Current Detection (OCD)"`
+	TestSCD *subcommand `arg:"subcommand:test-scd" help:"Test Short Circuit Detection (SCD)"`
 
 	// Sequences
-	RunChargeSeq    bool `arg:"--run-charge-seq" help:"Run the charge sequence and exit"`
-	RunDischargeSeq bool `arg:"--run-discharge-seq" help:"Run the discharge sequence and exit"`
+	RunChargeSeq    *subcommandDuration `arg:"subcommand:run-charge-seq" help:"Run the charge sequence and exit"`
+	RunDischargeSeq *subcommandDuration `arg:"subcommand:run-discharge-seq" help:"Run the discharge sequence and exit"`
+	RunMonitorSeq   *subcommandDuration `arg:"subcommand:run-monitor-seq" help:"Run the monitor sequence and exit"`
+	RunBalanceSeq   *subcommandDuration `arg:"subcommand:run-balance-seq" help:"Run the balance sequence and exit"`
+
+	RunFullTests *subcommandDuration `arg:"subcommand:run-full-test" help:"Loop through running the full test sequence."`
 
 	// Logging
 	logging.LogArgs
+}
+
+type subcommand struct {
+}
+
+type subcommandDuration struct {
+	Duration int `arg:"--duration" default:"0" help:"Option to limit the duration of a test sequence in minutes."`
 }
 
 func (Args) Version() string {
@@ -107,7 +113,7 @@ func runMain() error {
 	// ==== Different Test Modes ====
 
 	// Test reading serial from battery
-	if args.TestSerial {
+	if args.TestSerial != nil {
 		for {
 			battState := <-battStateChan
 			log.Printf("Battery State: %s", battState)
@@ -115,51 +121,54 @@ func runMain() error {
 	}
 
 	// Test reading temperature from the CC load.
-	if args.TestTemp {
-		tempC, err := hw.readTemperature()
+	if args.TestADC != nil {
+		tempC, err := hw.readCCTemperature()
 		if err != nil {
 			return fmt.Errorf("reading temperature: %v", err)
 		}
 		log.Printf("Temperature: %.1f°C", tempC)
-		return nil
-	}
 
-	// Test Reading Battery Voltage
-	if args.TestBatteryV {
+		hatC, err := hw.readHatTemperature()
+		if err != nil {
+			return fmt.Errorf("reading temperature: %v", err)
+		}
+		log.Printf("HAT Temperature: %.1f°C", hatC)
+
 		v, err := hw.readBatteryVoltage()
 		if err != nil {
 			return fmt.Errorf("reading battery voltage: %v", err)
 		}
 		log.Printf("Battery voltage: %.3fV", v)
+
 		return nil
 	}
 
-	// Test Charging the battery
-	if args.TestCharge {
-		pass, err := hw.testCharge(battStateChan)
-		if err != nil {
-			return fmt.Errorf("charge test errored: %v", err)
-		}
-		if !pass {
-			return fmt.Errorf("charge test failed")
-		}
-		return nil
-	}
+	// // Test Charging the battery
+	// if args.TestCharge != nil {
+	// 	pass, err := hw.testCharge(battStateChan)
+	// 	if err != nil {
+	// 		return fmt.Errorf("charge test errored: %v", err)
+	// 	}
+	// 	if !pass {
+	// 		return fmt.Errorf("charge test failed")
+	// 	}
+	// 	return nil
+	// }
 
-	// Test Discharging the battery
-	if args.TestDischarge {
-		pass, err := hw.testDischarge(battStateChan)
-		if err != nil {
-			return fmt.Errorf("discharge test errored: %v", err)
-		}
-		if !pass {
-			return fmt.Errorf("discharge test failed")
-		}
-		return nil
-	}
+	// // Test Discharging the battery
+	// if args.TestDischarge != nil {
+	// 	pass, err := hw.testDischarge(battStateChan)
+	// 	if err != nil {
+	// 		return fmt.Errorf("discharge test errored: %v", err)
+	// 	}
+	// 	if !pass {
+	// 		return fmt.Errorf("discharge test failed")
+	// 	}
+	// 	return nil
+	// }
 
 	// Short Circuit Test
-	if args.TestSCD {
+	if args.TestSCD != nil {
 		pass, err := hw.testShortCircuit(battStateChan)
 		if err != nil {
 			return fmt.Errorf("short circuit test errored: %v", err)
@@ -171,7 +180,7 @@ func runMain() error {
 	}
 
 	// Over current discharge test
-	if args.TestOCD {
+	if args.TestOCD != nil {
 		pass, err := hw.overCurrentDischargeTest(battStateChan)
 		if err != nil {
 			return fmt.Errorf("OCD test errored: %v", err)
@@ -179,39 +188,56 @@ func runMain() error {
 		if !pass {
 			return fmt.Errorf("OCD test failed")
 		}
+		log.Info("OCD test passed.")
 		return nil
 	}
 
 	// Run Charge Sequence
-	if args.RunChargeSeq {
-		return hw.runChargeSeq(battStateChan, 0, "./", "charge", false)
+	if args.RunChargeSeq != nil {
+		return hw.runChargeSeq(battStateChan, 0, "./", "charge", args.RunChargeSeq.Duration)
 	}
 
 	// Run Discharge Sequence
-	if args.RunDischargeSeq {
-		return hw.runDischargeSeq(battStateChan, "./", "discharge", 4, false)
+	if args.RunDischargeSeq != nil {
+		return hw.runDischargeSeq(battStateChan, "./", "discharge", 4, args.RunDischargeSeq.Duration)
 	}
 
-	if args.RunMonitorTest {
-		return hw.runMonitorTest(battStateChan, "./", false)
+	// Run Monitor Sequence
+	if args.RunMonitorSeq != nil {
+		return hw.runMonitorTest(battStateChan, "./", args.RunMonitorSeq.Duration)
 	}
 
-	if args.RunFullTests {
+	// Run Balance Sequence
+	if args.RunBalanceSeq != nil {
+		return hw.waitForCellsToBalance(battStateChan, "./", args.RunBalanceSeq.Duration)
+	}
+
+	if args.RunFullTests != nil {
 		for {
-			err := runFullTest(hw, battStateChan, args.QuickTest)
+			// Run full test
+			err := runFullTest(hw, battStateChan, args.RunFullTests.Duration)
 			if err != nil {
-				log.Errorf("full test failed/errored: %v", err)
+				log.Errorf("Full test failed/errored: %v", err)
 				hw.flashLED(200, 0, 0)
-				time.Sleep(5 * time.Second)
+			} else {
+				log.Info("Full test passed.")
+				hw.flashLED(0, 200, 0)
 			}
+
+			// Wait for USB to be disconnected
+			log.Info("Waiting for USB to be disconnected.")
+			if err := waitForUSBRemoval(); err != nil {
+				log.Errorf("waiting for USB removal: %v", err)
+			}
+			log.Info("USB disconnected.")
 		}
 	}
 
 	return nil
 }
 
-func runFullTest(hw *hardware, battStateChan chan BatteryStatus, quickTest bool) error {
-	log.Info("=== Full Test Sequence Setup ===\n\n")
+func runFullTest(hw *hardware, battStateChan chan BatteryStatus, testDuration int) error {
+	log.Info("=== Full Test Sequence Setup ===\n")
 	hw.solidLED(true, false, false)
 
 	log.Info("=== Waiting for USB device to be connected. ===")
@@ -219,15 +245,26 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, quickTest bool)
 	if err != nil {
 		return fmt.Errorf("waiting for USB device: %v", err)
 	}
-	log.Infof("Found USB device, mounted at %s.\n\n", usbMountPath)
+	log.Infof("Found USB device, mounted at %s.\n", usbMountPath)
 	hw.flashLED(1000, 0, 0)
+
+	// The drive gets pulled after every run so its data can be copied off, then
+	// plugged back in for the next battery. Unmount cleanly and wait for it to
+	// actually be removed before returning, regardless of how the test below
+	// turns out, so it's never yanked while still mounted.
+	defer func() {
+		log.Info("=== Unmounting USB drive — safe to remove it now ===")
+		if err := unmountUSBDrive(); err != nil {
+			log.Errorf("unmounting USB drive: %v", err)
+		}
+	}()
 
 	log.Info("=== Waiting for battery to be plugged in ===")
 	batteryState := <-battStateChan
-	log.Infof("Battery detected: %s\n\n", batteryState)
+	log.Infof("Battery detected: %s\n", batteryState)
 	hw.flashLED(0, 1000, 0)
 
-	log.Info("=== Running Full Test Sequence ===\n\n")
+	log.Info("=== Running Full Test Sequence ===\n")
 
 	results := &testResults{}
 
@@ -242,21 +279,21 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, quickTest bool)
 
 	step := 1
 	log.Infof("=== Step %d: Waiting for cells to be balanced ===", step)
-	if err := hw.waitForCellsToBalance(battStateChan, resultsDir, quickTest); err != nil {
+	if err := hw.waitForCellsToBalance(battStateChan, resultsDir, testDuration); err != nil {
 		return fmt.Errorf("error waiting for cells to balance: %v", err)
 	}
 	time.Sleep(time.Second)
 
 	step++
 	log.Infof("=== Step %d: Initial Battery Discharge ===", step)
-	if err := hw.runDischargeSeq(battStateChan, resultsDir, "initial_discharge", 2, quickTest); err != nil {
+	if err := hw.runDischargeSeq(battStateChan, resultsDir, "initial_discharge", 4, testDuration); err != nil {
 		return fmt.Errorf("charge step failed: %v", err)
 	}
 	time.Sleep(time.Second)
 
 	step++
 	log.Infof("=== Step %d: Full Battery Charge ===", step)
-	if err := hw.runChargeSeq(battStateChan, 0, resultsDir, "full_charge", quickTest); err != nil {
+	if err := hw.runChargeSeq(battStateChan, 0, resultsDir, "full_charge", testDuration); err != nil {
 		return fmt.Errorf("charge step failed: %v", err)
 	}
 	time.Sleep(time.Second)
@@ -281,21 +318,21 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, quickTest bool)
 
 	step++
 	log.Infof("=== Step %d: Discharging battery at 2A ===", step)
-	if err := hw.runDischargeSeq(battStateChan, resultsDir, "full_discharge", 4, quickTest); err != nil {
+	if err := hw.runDischargeSeq(battStateChan, resultsDir, "full_discharge", 4, testDuration); err != nil {
 		return fmt.Errorf("discharge step failed: %v", err)
 	}
 	time.Sleep(time.Second)
 
 	step++
 	log.Infof("=== Step %d: Charging to rest voltage (%.1fV) ===", step, restVoltage)
-	if err := hw.runChargeSeq(battStateChan, restVoltage, resultsDir, "rest_charge", quickTest); err != nil {
+	if err := hw.runChargeSeq(battStateChan, restVoltage, resultsDir, "rest_charge", testDuration); err != nil {
 		return fmt.Errorf("charge step failed: %v", err)
 	}
 	time.Sleep(time.Second)
 
 	step++
 	log.Infof("=== Step %d: Monitoring ===", step)
-	if err := hw.runMonitorTest(battStateChan, resultsDir, quickTest); err != nil {
+	if err := hw.runMonitorTest(battStateChan, resultsDir, testDuration); err != nil {
 		return fmt.Errorf("monitor step failed: %v", err)
 	}
 	time.Sleep(time.Second)

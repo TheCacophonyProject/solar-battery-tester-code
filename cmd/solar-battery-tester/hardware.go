@@ -47,9 +47,8 @@ const (
 	i2cAddrINA219Discharge = 0x41 // U405: A0=VDD, A1=GND
 )
 
-// Battery voltage divider: R417=470kΩ (top), R418=100kΩ (bottom).
-// const battVoltDividerRatio = (470.0 + 100.0) / 100.0
-const battVoltDividerRatio = 5.7
+// Battery voltage divider: Sense series resistor (2.2k) R417=330kΩ (top), R418=100kΩ (bottom).
+const battVoltDividerRatio = (2.2 + 330.0 + 100.0) / 100.0
 
 type hardware struct {
 	bus                 i2c.BusCloser
@@ -199,7 +198,7 @@ func ledHandler(hw *hardware, channel chan [3]led) {
 	// LED GPIOs are active-low: driving the pin LOW turns the LED on.
 	apply := func() {
 		r, g, b := current[0].on && on, current[1].on && on, current[2].on && on
-		log.Infof("Setting LED: %v %v %v", r, g, b)
+		// log.Infof("Setting LED: %v %v %v", r, g, b)
 		if err := hw.ledR.Out(gpioLevel(!r)); err != nil {
 			log.Warnf("Setting LED: %v", err)
 		}
@@ -302,13 +301,11 @@ func (hw *hardware) readDischargeMonitor() (voltage, current float64, err error)
 // readBatteryVoltage returns the battery pack voltage in volts via the ADS1115.
 func (hw *hardware) readBatteryVoltage() (volts float64, err error) {
 	err = withRetry("battery voltage", 3, func() error {
-		raw, e := hw.adc.readChannel(0)
-		//log.Println(raw)
-		if e != nil {
-			return e
+		raw, err := hw.adc.readChannel(0)
+		if err != nil {
+			return err
 		}
-		// volts = raw * battVoltDividerRatio This is what should be used but because of issue on PCB we need to use the below equation.
-		volts = raw * battVoltDividerRatio * 11.77 / 8.87
+		volts = raw * battVoltDividerRatio
 		return nil
 	})
 	return
@@ -354,10 +351,22 @@ func voltageToTemperature(v float64) (float64, error) {
 	return 0, fmt.Errorf("thermistor resistance %.3fkΩ out of table range", resKOhm)
 }
 
-// readTemperature returns the temperature in °C from the NTC thermistor on J405.
-func (hw *hardware) readTemperature() (tempC float64, err error) {
+// readCCTemperature returns the temperature in °C from the NTC thermistor on J405.
+func (hw *hardware) readCCTemperature() (tempC float64, err error) {
 	err = withRetry("temperature", 3, func() error {
 		v, e := hw.adc.readChannel(1)
+		if e != nil {
+			return e
+		}
+		tempC, e = voltageToTemperature(v)
+		return e
+	})
+	return
+}
+
+func (hw *hardware) readHatTemperature() (tempC float64, err error) {
+	err = withRetry("temperature", 3, func() error {
+		v, e := hw.adc.readChannel(2)
 		if e != nil {
 			return e
 		}
@@ -476,9 +485,14 @@ func (hw *hardware) overCurrentDischargeTest(battStateChan chan BatteryStatus) (
 	time.Sleep(time.Second * 9)
 
 	// Take battery voltage reading before triggering discharge.
-	batteryVoltage, err := hw.readBatteryVoltage()
+	batterySenseVoltage, err := hw.readBatteryVoltage()
 	if err != nil {
 		return false, fmt.Errorf("reading battery voltage: %v", err)
+	}
+	voltage, current, err := hw.readDischargeMonitor()
+	if err != nil {
+		log.Errorf("Reading charge monitor: %v", err)
+		return false, err
 	}
 
 	// Trigger over current discharge.
@@ -492,13 +506,13 @@ func (hw *hardware) overCurrentDischargeTest(battStateChan chan BatteryStatus) (
 	if err != nil {
 		return false, fmt.Errorf("reading battery voltage: %v", err)
 	}
-	voltage, current, err := hw.readChargeMonitor()
+	ocdVoltage, ocdCurrent, err := hw.readDischargeMonitor()
 	if err != nil {
 		log.Errorf("Reading charge monitor: %v", err)
 		return false, err
 	}
-	hw.setCCLoads(0)
 	log.Info("Stopping over current discharge.")
+	hw.setCCLoads(0)
 
 	log.Info("Waiting for battery voltage to recover.")
 	recovered := false
@@ -519,10 +533,15 @@ func (hw *hardware) overCurrentDischargeTest(battStateChan chan BatteryStatus) (
 		return false, nil
 	}
 
-	//log.Infof("Battery Status: %s", batteryStatus)
-	log.Infof("Battery Before OCD; SenseVoltage: %v", fmtF(batteryVoltage))
-	log.Infof("Battery During OCD; Sense Voltage: %v", fmtF(ocdBatterySenseVoltage))
-	log.Infof("Battery During OCD: Voltage: %v, Current: %v", fmtF(voltage), fmtF(current))
+	log.Infof("Before OCD; Sense Voltage: %v, Battery Voltage: %v, Current: %v",
+		fmtF(batterySenseVoltage), fmtF(voltage), fmtF(current))
+	log.Infof("During OCD; Sense Voltage: %v, Battery Voltage: %v, Current: %v",
+		fmtF(ocdBatterySenseVoltage), fmtF(ocdVoltage), fmtF(ocdCurrent))
+
+	if math.Abs(ocdCurrent) > 0.050 {
+		log.Error("Current during over current discharge too high.")
+		return false, nil
+	}
 
 	return true, nil
 }
@@ -540,21 +559,26 @@ func (hw *hardware) testShortCircuit(battStateChan chan BatteryStatus) (bool, er
 		return false, fmt.Errorf("setting short circuit: %v", err)
 	}
 	defer hw.setShortCircuit(false)
-	time.Sleep(100 * time.Millisecond)
 
+	// Give it 1ms to trigger the protection
+	time.Sleep(1 * time.Millisecond)
+
+	// Read the discharge monitor
 	voltage, current, err := hw.readDischargeMonitor()
 	if err != nil {
 		return false, fmt.Errorf("reading discharge monitor: %v", err)
 	}
-	log.Println(voltage, current)
-	if voltage > 0.1 {
-		log.Println("Voltage too high.")
-		return false, nil
-	}
 
-	// Disable short and wait for battery voltage to recover.
+	// Disable short
 	if err := hw.setShortCircuit(false); err != nil {
 		return false, fmt.Errorf("setting short circuit: %v", err)
+	}
+
+	// Check if short protection triggered
+	log.Infof("Short circuit; Voltage: %v, Current: %v", fmtF(voltage), fmtF(current))
+	if math.Abs(current) > 0.1 {
+		log.Println("Current too high.")
+		return false, nil
 	}
 
 	// Enable charge to enable battery pack again.
@@ -568,10 +592,12 @@ func (hw *hardware) testShortCircuit(battStateChan chan BatteryStatus) (bool, er
 	for range 20 {
 		time.Sleep(time.Second)
 		batV, err := hw.readBatteryVoltage()
+		log.Infof("Battery voltage: %v", fmtF(batV))
 		if err != nil {
 			return false, fmt.Errorf("reading battery voltage: %v", err)
 		}
-		if batV > 9 {
+		if batV > 8.5 {
+			log.Println("Battery voltage recovered.")
 			recovered = true
 			break
 		}
@@ -606,7 +632,7 @@ func (hw *hardware) readSensors() *hardwareState {
 		log.Warnf("Reading charge monitor: %v", err)
 		return nil
 	}
-	ccLoadTemp, err := hw.readTemperature()
+	ccLoadTemp, err := hw.readCCTemperature()
 	if err != nil {
 		log.Warnf("Reading temperature: %v", err)
 		return nil
@@ -628,7 +654,7 @@ func (hw *hardware) readSensors() *hardwareState {
 }
 
 // runChargeSeq will charge the battery to the target voltage. If you want to charge until the battery is fill leave targetVoltage = 0.
-func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus, targetVoltage float64, dataDir, prefix string, quickTest bool) error {
+func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus, targetVoltage float64, dataDir, prefix string, duration int) error {
 	if targetVoltage == 0 {
 		log.Info("Running charge sequence until battery is full")
 	} else {
@@ -655,14 +681,14 @@ func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus, targetVoltage
 	defer cleanupFunc()
 
 	timeout := time.After(chargeTimeoutDuration)
-	if quickTest {
-		timeout = time.After(5 * time.Minute)
+	if duration > 0 {
+		timeout = time.After(time.Duration(duration) * time.Minute)
 	}
 	var lastReportTime time.Time
 	for {
 		select {
 		case <-timeout:
-			if quickTest {
+			if duration > 0 {
 				log.Info("Exiting charge sequence early for quick test.")
 				return nil
 			}
@@ -702,7 +728,7 @@ func (hw *hardware) runChargeSeq(battStateChan chan BatteryStatus, targetVoltage
 	}
 }
 
-func (hw *hardware) runMonitorTest(battStateChan chan BatteryStatus, dataDir string, quickTest bool) error {
+func (hw *hardware) runMonitorTest(battStateChan chan BatteryStatus, dataDir string, testDuration int) error {
 	// Disable charging
 	if err := hw.setChargeEnable(false); err != nil {
 		return fmt.Errorf("setting charge enable: %v", err)
@@ -720,8 +746,8 @@ func (hw *hardware) runMonitorTest(battStateChan chan BatteryStatus, dataDir str
 	defer cleanup()
 
 	monitorDuration := 12 * time.Hour
-	if quickTest {
-		monitorDuration = 5 * time.Minute
+	if testDuration > 0 {
+		monitorDuration = time.Duration(testDuration) * time.Minute
 	}
 
 	monitorUntil := time.After(monitorDuration)
@@ -731,7 +757,7 @@ func (hw *hardware) runMonitorTest(battStateChan chan BatteryStatus, dataDir str
 	for {
 		select {
 		case <-monitorUntil:
-			if quickTest {
+			if testDuration > 0 {
 				log.Info("Exiting monitoring sequence early for quick test.")
 				return nil
 			}
@@ -756,7 +782,7 @@ func (hw *hardware) runMonitorTest(battStateChan chan BatteryStatus, dataDir str
 	}
 }
 
-func (hw *hardware) waitForCellsToBalance(battStateChan chan BatteryStatus, dataDir string, quickTets bool) error {
+func (hw *hardware) waitForCellsToBalance(battStateChan chan BatteryStatus, dataDir string, duration int) error {
 	log.Println("Waiting for cells to balance.")
 	<-battStateChan
 
@@ -777,14 +803,14 @@ func (hw *hardware) waitForCellsToBalance(battStateChan chan BatteryStatus, data
 	defer csvCleanup()
 
 	timeout := time.After(24 * time.Hour)
-	if quickTets {
-		timeout = time.After(5 * time.Minute)
+	if duration > 0 {
+		timeout = time.After(time.Duration(duration) * time.Minute)
 	}
 	var lastReportTime time.Time
 	for {
 		select {
 		case <-timeout:
-			if quickTets {
+			if duration > 0 {
 				log.Info("Exiting balancing sequence early for quick test.")
 				return nil
 			}
@@ -815,7 +841,7 @@ func (hw *hardware) waitForCellsToBalance(battStateChan chan BatteryStatus, data
 	}
 }
 
-func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir string, filePrefix string, ccLoads int, quickTest bool) error {
+func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir string, filePrefix string, ccLoads int, duration int) error {
 	log.Println("Waiting for battery status.")
 	<-battStateChan
 
@@ -841,15 +867,15 @@ func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir st
 	defer cleanup()
 
 	timeout := time.After(12 * time.Hour)
-	if quickTest {
-		timeout = time.After(5 * time.Minute)
+	if duration > 0 {
+		timeout = time.After(time.Duration(duration) * time.Minute)
 	}
 	var lastReportTime time.Time
 	lastVoltageReading := 0.0
 	for {
 		select {
 		case <-timeout:
-			if quickTest {
+			if duration > 0 {
 				log.Info("Exiting discharge sequence early for quick test.")
 				return nil
 			}

@@ -30,28 +30,92 @@ const (
 	usbPollInterval = 2 * time.Second
 )
 
-// waitForUSBDrive polls for a removable USB mass-storage device, mounts its
-// first partition (or the whole disk if unpartitioned) at usbMountPoint, and
-// returns the mount point. It blocks until a drive is found or ctx-like
-// cancellation isn't needed here since this only runs at startup.
+// waitForUSBDrive polls for a removable USB mass-storage device and mounts it
+// at usbMountPoint, returning once it's mounted and confirmed writable.
+//
+// Drives get pulled out between test runs (to copy data off) and a different
+// one plugged back in, so on each call this also clears out any mount left
+// over from a drive that's no longer the one currently plugged in — whether
+// because it was properly unmounted by unmountUSBDrive, or yanked without
+// unmounting first (which otherwise leaves a dead mount pointing at a device
+// that no longer exists).
 func waitForUSBDrive() (string, error) {
 	for {
 		dev, err := findUSBPartition()
 		if err != nil {
 			return "", err
 		}
-		if dev != "" {
-			if err := os.MkdirAll(usbMountPoint, 0o755); err != nil {
-				return "", fmt.Errorf("creating USB mount point: %v", err)
+		if dev == "" {
+			time.Sleep(usbPollInterval)
+			continue
+		}
+
+		if err := os.MkdirAll(usbMountPoint, 0o755); err != nil {
+			return "", fmt.Errorf("creating USB mount point: %v", err)
+		}
+
+		mountedDev, mounted := currentMountSource(usbMountPoint)
+		if mounted && mountedDev != dev {
+			log.Warnf("Stale mount at %s (was %s, now %s present) — clearing it", usbMountPoint, mountedDev, dev)
+			if out, err := exec.Command("umount", "-l", usbMountPoint).CombinedOutput(); err != nil {
+				log.Warnf("Failed to clear stale mount: %v (%s)", err, strings.TrimSpace(string(out)))
 			}
-			if !isMounted(usbMountPoint) {
-				if out, err := exec.Command("mount", dev, usbMountPoint).CombinedOutput(); err != nil {
-					log.Warnf("Failed to mount %s at %s: %v (%s)", dev, usbMountPoint, err, strings.TrimSpace(string(out)))
-					time.Sleep(usbPollInterval)
-					continue
-				}
+			mounted = false
+		}
+
+		if !mounted {
+			if out, err := exec.Command("mount", dev, usbMountPoint).CombinedOutput(); err != nil {
+				log.Warnf("Failed to mount %s at %s: %v (%s)", dev, usbMountPoint, err, strings.TrimSpace(string(out)))
+				time.Sleep(usbPollInterval)
+				continue
 			}
-			return usbMountPoint, nil
+		}
+
+		if err := checkWritable(usbMountPoint); err != nil {
+			log.Warnf("USB drive at %s is not writable, will retry: %v", usbMountPoint, err)
+			exec.Command("umount", "-l", usbMountPoint).Run()
+			time.Sleep(usbPollInterval)
+			continue
+		}
+
+		return usbMountPoint, nil
+	}
+}
+
+// checkWritable confirms path can actually be written to by creating and removing a temp file in it.
+func checkWritable(path string) error {
+	f, err := os.CreateTemp(path, ".write-test-*")
+	if err != nil {
+		return err
+	}
+	name := f.Name()
+	f.Close()
+	return os.Remove(name)
+}
+
+// unmountUSBDrive flushes and unmounts the drive at usbMountPoint so it's safe to
+// physically remove. Safe to call even if nothing is currently mounted there.
+func unmountUSBDrive() error {
+	if _, mounted := currentMountSource(usbMountPoint); !mounted {
+		return nil
+	}
+	exec.Command("sync").Run()
+	if out, err := exec.Command("umount", usbMountPoint).CombinedOutput(); err != nil {
+		return fmt.Errorf("unmounting %s: %v (%s)", usbMountPoint, err, strings.TrimSpace(string(out)))
+	}
+	return nil
+}
+
+// waitForUSBRemoval blocks until no removable USB disk is present, so the rest
+// of the program doesn't race ahead of the user physically pulling the drive.
+func waitForUSBRemoval() error {
+	for {
+		dev, err := findUSBPartition()
+		if err != nil {
+			return err
+		}
+		if dev == "" {
+			return nil
 		}
 		time.Sleep(usbPollInterval)
 	}
@@ -90,17 +154,17 @@ func findUSBPartition() (string, error) {
 	return "", nil
 }
 
-// isMounted reports whether path is currently a mount point.
-func isMounted(path string) bool {
+// currentMountSource returns the device currently mounted at path, if any.
+func currentMountSource(path string) (dev string, mounted bool) {
 	data, err := os.ReadFile("/proc/mounts")
 	if err != nil {
-		return false
+		return "", false
 	}
 	for _, line := range strings.Split(string(data), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) > 1 && fields[1] == path {
-			return true
+			return fields[0], true
 		}
 	}
-	return false
+	return "", false
 }
