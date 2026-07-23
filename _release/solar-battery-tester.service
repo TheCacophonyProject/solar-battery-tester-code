@@ -3,7 +3,7 @@ Description=Cacophony Project Solar Battery Tester
 After=multi-user.target
 
 [Service]
-ExecStart=/usr/bin/solar-battery-tester
+ExecStart=/usr/bin/solar-battery-tester run-full-test
 Restart=on-failure
 RestartSec=5s
 
