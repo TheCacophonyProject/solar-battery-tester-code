@@ -175,7 +175,7 @@ func crc16CCITT(data []byte) uint16 {
 
 // runBatteryMonitor reads and prints battery status messages in a loop until interrupted,
 // writing each parsed status into ch.
-func runBatteryMonitor(serialDev string, ch chan<- BatteryStatus) error {
+func runBatteryMonitor(serialDev string, ch chan BatteryStatus) error {
 	log.Printf("Monitoring battery UART on %s at %d baud", serialDev, batteryBaudRate)
 	port, err := serial.OpenPort(&serial.Config{
 		Name:        serialDev,
@@ -187,6 +187,7 @@ func runBatteryMonitor(serialDev string, ch chan<- BatteryStatus) error {
 	}
 	defer port.Close()
 
+	dropping := false
 	for {
 		s, err := readBatteryStatus(port, 30*time.Second)
 		if err != nil {
@@ -195,8 +196,24 @@ func runBatteryMonitor(serialDev string, ch chan<- BatteryStatus) error {
 		}
 		select {
 		case ch <- *s:
+			dropping = false
 		default:
-			log.Warnf("Battery status channel full, dropping message")
+			// Channel is full because nothing is reading it fast enough.
+			// Drop the oldest buffered message to make room so the channel
+			// keeps holding the latest status instead of stale backlog.
+			select {
+			case <-ch:
+				if !dropping {
+					log.Warn("Battery status channel full, dropping messages")
+				}
+				dropping = true
+			default:
+			}
+			select {
+			case ch <- *s:
+			default:
+				log.Error("Battery status channel full, dropping message")
+			}
 		}
 		log.Debugf("Battery status: %s", s)
 	}

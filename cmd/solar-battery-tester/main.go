@@ -98,7 +98,7 @@ func runMain() error {
 	defer hw.close()
 
 	// Initialize battery message monitor
-	battStateChan := make(chan BatteryStatus, 100)
+	battStateChan := make(chan BatteryStatus, 1)
 	go func() {
 		if err := runBatteryMonitor(args.BatterySerial, battStateChan); err != nil {
 			log.Errorf("Battery monitor error: %v", err)
@@ -262,7 +262,7 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, testDuration in
 	log.Info("=== Waiting for battery to be plugged in ===")
 	batteryState := <-battStateChan
 	log.Infof("Battery detected: %s\n", batteryState)
-	hw.flashLED(0, 1000, 0)
+	hw.flashLED(0, 0, 1000)
 
 	log.Info("=== Running Full Test Sequence ===\n")
 
