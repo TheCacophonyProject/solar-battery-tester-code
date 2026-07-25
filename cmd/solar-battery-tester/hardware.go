@@ -841,7 +841,7 @@ func (hw *hardware) waitForCellsToBalance(battStateChan chan BatteryStatus, data
 	}
 }
 
-func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir string, filePrefix string, ccLoads int, duration int) error {
+func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir string, filePrefix string, ccLoads int, duration int, fullDischarge bool) error {
 	log.Println("Waiting for battery status.")
 	<-battStateChan
 
@@ -891,6 +891,29 @@ func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir st
 			hardwareState := hw.readSensors()
 			if err := writeCSVState(hardwareState, batteryState, writer); err != nil {
 				return err
+			}
+
+			// If fullDischarge is true, reduce the discharge current as the battery discharges.
+			// This is to prevent the battery from turning off too early from a high discharge current.
+			if fullDischarge {
+				// Reduce the discharge current by 500mA, but don't go below 500mA
+				minCellmV := min(batteryState.Cell1mV, batteryState.Cell2mV, batteryState.Cell3mV)
+				log.Infof("(%d, %d, %d)", batteryState.Cell1mV, batteryState.Cell2mV, batteryState.Cell3mV)
+				if minCellmV < 3200 {
+					if ccLoads > 1 {
+						log.Infof("Cells are getting low (%d, %d, %d), reducing discharge current by 500mA", batteryState.Cell1mV, batteryState.Cell2mV, batteryState.Cell3mV)
+						log.Info("Reducing discharge current by 500mA")
+						ccLoads -= 1
+						if err := hw.setCCLoads(ccLoads); err != nil {
+							log.Errorf("setting CC loads: %v", err)
+						}
+					}
+
+				}
+				if hardwareState.dischargeVoltage < 9.3 {
+					log.Info("Battery has discharged, stopping.")
+					return nil
+				}
 			}
 
 			if time.Since(lastReportTime) > logRate {

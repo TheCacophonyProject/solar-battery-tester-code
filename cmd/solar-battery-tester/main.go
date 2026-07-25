@@ -44,16 +44,15 @@ type Args struct {
 	// Unit Tests
 	TestSerial *subcommand `arg:"subcommand:test-serial" help:"Test the serial port connection and exit"`
 	TestADC    *subcommand `arg:"subcommand:test-adc" help:"Read and print the values from the ADC"`
-	// TestCharge    *subcommand `arg:"subcommand:test-charge" help:"Test that we can charge the battery"`
-	// TestDischarge *subcommand `arg:"subcommand:test-discharge" help:"Test that we can discharge the battery"`
-	TestOCD *subcommand `arg:"subcommand:test-ocd" help:"Test Over Current Detection (OCD)"`
-	TestSCD *subcommand `arg:"subcommand:test-scd" help:"Test Short Circuit Detection (SCD)"`
+	TestOCD    *subcommand `arg:"subcommand:test-ocd" help:"Test Over Current Detection (OCD)"`
+	TestSCD    *subcommand `arg:"subcommand:test-scd" help:"Test Short Circuit Detection (SCD)"`
 
 	// Sequences
-	RunChargeSeq    *subcommandDuration `arg:"subcommand:run-charge-seq" help:"Run the charge sequence and exit"`
-	RunDischargeSeq *subcommandDuration `arg:"subcommand:run-discharge-seq" help:"Run the discharge sequence and exit"`
-	RunMonitorSeq   *subcommandDuration `arg:"subcommand:run-monitor-seq" help:"Run the monitor sequence and exit"`
-	RunBalanceSeq   *subcommandDuration `arg:"subcommand:run-balance-seq" help:"Run the balance sequence and exit"`
+	RunChargeSeq        *subcommandDuration `arg:"subcommand:run-charge-seq" help:"Run the charge sequence and exit"`
+	RunDischargeSeq     *subcommandDuration `arg:"subcommand:run-discharge-seq" help:"Run the discharge sequence and exit"`
+	RunFullDischargeSeq *subcommandDuration `arg:"subcommand:run-full-discharge-seq" help:"Run the full discharge sequence and exit"`
+	RunMonitorSeq       *subcommandDuration `arg:"subcommand:run-monitor-seq" help:"Run the monitor sequence and exit"`
+	RunBalanceSeq       *subcommandDuration `arg:"subcommand:run-balance-seq" help:"Run the balance sequence and exit"`
 
 	RunFullTests *subcommandDuration `arg:"subcommand:run-full-test" help:"Loop through running the full test sequence."`
 
@@ -199,7 +198,12 @@ func runMain() error {
 
 	// Run Discharge Sequence
 	if args.RunDischargeSeq != nil {
-		return hw.runDischargeSeq(battStateChan, "./", "discharge", 4, args.RunDischargeSeq.Duration)
+		return hw.runDischargeSeq(battStateChan, "./", "discharge", 4, args.RunDischargeSeq.Duration, false)
+	}
+
+	// Run Full Discharge Sequence
+	if args.RunFullDischargeSeq != nil {
+		return hw.runDischargeSeq(battStateChan, "./", "discharge", 4, args.RunFullDischargeSeq.Duration, true)
 	}
 
 	// Run Monitor Sequence
@@ -286,7 +290,7 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, testDuration in
 
 	step++
 	log.Infof("=== Step %d: Initial Battery Discharge ===", step)
-	if err := hw.runDischargeSeq(battStateChan, resultsDir, "initial_discharge", 4, testDuration); err != nil {
+	if err := hw.runDischargeSeq(battStateChan, resultsDir, "initial_discharge", 4, testDuration, true); err != nil {
 		return fmt.Errorf("charge step failed: %v", err)
 	}
 	time.Sleep(time.Second)
@@ -318,7 +322,7 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, testDuration in
 
 	step++
 	log.Infof("=== Step %d: Discharging battery at 2A ===", step)
-	if err := hw.runDischargeSeq(battStateChan, resultsDir, "full_discharge", 4, testDuration); err != nil {
+	if err := hw.runDischargeSeq(battStateChan, resultsDir, "full_discharge", 4, testDuration, false); err != nil {
 		return fmt.Errorf("discharge step failed: %v", err)
 	}
 	time.Sleep(time.Second)
