@@ -31,7 +31,7 @@ const (
 	dischargeTempLimitC   = 80.0 // °C - stop discharging above this temperature
 	chargeTimeoutDuration = 12 * time.Hour
 	testDataDir           = "/var/lib/solar-battery-tester/data"
-	restVoltage           = 11.3
+	restVoltage           = 3.9 * 3 // Target voltage when charging to rest voltage, note that the voltage will settle below this when the charging is turned off.
 	logRate               = 20 * time.Minute
 )
 

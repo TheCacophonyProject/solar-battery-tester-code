@@ -898,7 +898,6 @@ func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir st
 			if fullDischarge {
 				// Reduce the discharge current by 500mA, but don't go below 500mA
 				minCellmV := min(batteryState.Cell1mV, batteryState.Cell2mV, batteryState.Cell3mV)
-				log.Infof("(%d, %d, %d)", batteryState.Cell1mV, batteryState.Cell2mV, batteryState.Cell3mV)
 				if minCellmV < 3200 {
 					if ccLoads > 1 {
 						log.Infof("Cells are getting low (%d, %d, %d), reducing discharge current by 500mA", batteryState.Cell1mV, batteryState.Cell2mV, batteryState.Cell3mV)
