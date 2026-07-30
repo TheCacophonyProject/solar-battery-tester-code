@@ -17,7 +17,10 @@
 package main
 
 import (
+	"archive/zip"
+	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"time"
@@ -141,30 +144,6 @@ func runMain() error {
 
 		return nil
 	}
-
-	// // Test Charging the battery
-	// if args.TestCharge != nil {
-	// 	pass, err := hw.testCharge(battStateChan)
-	// 	if err != nil {
-	// 		return fmt.Errorf("charge test errored: %v", err)
-	// 	}
-	// 	if !pass {
-	// 		return fmt.Errorf("charge test failed")
-	// 	}
-	// 	return nil
-	// }
-
-	// // Test Discharging the battery
-	// if args.TestDischarge != nil {
-	// 	pass, err := hw.testDischarge(battStateChan)
-	// 	if err != nil {
-	// 		return fmt.Errorf("discharge test errored: %v", err)
-	// 	}
-	// 	if !pass {
-	// 		return fmt.Errorf("discharge test failed")
-	// 	}
-	// 	return nil
-	// }
 
 	// Short Circuit Test
 	if args.TestSCD != nil {
@@ -308,7 +287,7 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, testDuration in
 	if err != nil {
 		return fmt.Errorf("OCD test errored: %v", err)
 	}
-	results.ocdPass = pass
+	results.OCDPass = pass
 	time.Sleep(time.Second)
 
 	step++
@@ -317,7 +296,7 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, testDuration in
 	if err != nil {
 		return fmt.Errorf("short circuit test errored: %v", err)
 	}
-	results.shortCircuitPass = pass
+	results.ShortCircuitPass = pass
 	time.Sleep(time.Second)
 
 	step++
@@ -343,6 +322,17 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, testDuration in
 
 	log.Println("=== Results ===")
 	results.print()
+
+	if err := results.save(resultsDir); err != nil {
+		log.Errorf("saving results.json: %v", err)
+	}
+
+	zipPath := resultsDir + ".zip"
+	log.Infof("Zipping results to: %s", zipPath)
+	if err := zipDir(resultsDir, zipPath); err != nil {
+		log.Errorf("zipping results directory: %v", err)
+	}
+
 	return nil
 }
 
@@ -352,32 +342,64 @@ type voltageReading struct {
 }
 
 type testResults struct {
-	chargeTime           time.Duration
-	chargeVoltage        float64
-	ocdPass              bool
-	shortCircuitPass     bool
-	dischargeTime        time.Duration
-	dischargeEndVoltage  float64
-	dischargeTempTripped bool
-	monitorReadings      []voltageReading
+	OCDPass          bool `json:"ocdPass"`
+	ShortCircuitPass bool `json:"shortCircuitPass"`
 }
 
 func (r *testResults) print() {
 	log.Println("=== Test Results ===")
-	log.Printf("Charge time:            %s", r.chargeTime.Round(time.Second))
-	log.Printf("Charge end voltage:     %.3fV", r.chargeVoltage)
-	log.Printf("OCD protection (3A):    %s", passFailStr(r.ocdPass))
-	log.Printf("Short circuit protect:  %s", passFailStr(r.shortCircuitPass))
-	log.Printf("Discharge time:         %s", r.dischargeTime.Round(time.Second))
-	log.Printf("Discharge end voltage:  %.3fV", r.dischargeEndVoltage)
-	if r.dischargeTempTripped {
-		log.Printf("Discharge temp limit:   TRIPPED (stopped at %.0f°C)", dischargeTempLimitC)
+	log.Printf("OCD protection (3A):    %s", passFailStr(r.OCDPass))
+	log.Printf("Short circuit protect:  %s", passFailStr(r.ShortCircuitPass))
+}
+
+// save writes the results as JSON into dir.
+func (r *testResults) save(dir string) error {
+	data, err := json.MarshalIndent(r, "", "  ")
+	if err != nil {
+		return fmt.Errorf("marshalling results: %v", err)
 	}
-	if len(r.monitorReadings) > 0 {
-		first := r.monitorReadings[0].voltage
-		last := r.monitorReadings[len(r.monitorReadings)-1].voltage
-		log.Printf("24h voltage drift:      %.3fV (%.3fV -> %.3fV)", last-first, first, last)
+	if err := os.WriteFile(filepath.Join(dir, "results.json"), data, 0o644); err != nil {
+		return fmt.Errorf("writing results.json: %v", err)
 	}
+	return nil
+}
+
+// zipDir writes the contents of srcDir into a new zip file at destZip, with
+// srcDir's own name as the top-level folder inside the archive.
+func zipDir(srcDir, destZip string) error {
+	zipFile, err := os.Create(destZip)
+	if err != nil {
+		return fmt.Errorf("creating zip file: %v", err)
+	}
+	defer zipFile.Close()
+
+	zw := zip.NewWriter(zipFile)
+	defer zw.Close()
+
+	baseDir := filepath.Dir(srcDir)
+	return filepath.Walk(srcDir, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			return nil
+		}
+		relPath, err := filepath.Rel(baseDir, path)
+		if err != nil {
+			return err
+		}
+		w, err := zw.Create(relPath)
+		if err != nil {
+			return err
+		}
+		f, err := os.Open(path)
+		if err != nil {
+			return err
+		}
+		defer f.Close()
+		_, err = io.Copy(w, f)
+		return err
+	})
 }
 
 func passFailStr(pass bool) string {
