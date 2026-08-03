@@ -1,5 +1,5 @@
 #!.venv/bin/python
-"""Plot a solar-battery-tester run from a CSV file.
+"""Plot a solar-battery-tester run from a CSV file or a results zip.
 
 The CSV columns are those written by makeStateCSVWriter() in hardware.go.
 
@@ -11,15 +11,23 @@ The plot layout depends on the run profile:
 The profile is auto-detected from the CSV filename prefix
 (discharging_*, charging_*, monitoring_*) or set with --profile.
 
+Given a zip file (as produced for a battery run, containing
+full_charge_*.csv, full_discharge_*.csv and monitoring_*.csv among other
+files), the full charge, full discharge and monitoring graphs are extracted,
+plotted and saved to an output folder instead.
+
 Usage:
     ./plot_results.py discharging_2026-07-02_10-30-00.csv
     ./plot_results.py charging_2026-07-02_10-30-00.csv --save charge.png
     ./plot_results.py results.csv --profile discharge
+    ./plot_results.py Battery_118___Time_2026-07-30_16-09-29.zip
+    ./plot_results.py results.zip --outdir plots/
 """
 
 import argparse
 import os
 import sys
+import zipfile
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -259,37 +267,121 @@ PLOTTERS = {
     "monitor": plot_monitor,
 }
 
+# Files to pull out of a run zip: (substring to match in the CSV's basename,
+# profile to plot it with, name used for the output PNG).
+ZIP_TARGETS = (
+    ("full_charge", "charge"),
+    ("full_discharge", "discharge"),
+    ("monitoring", "monitor"),
+)
+
+
+def load_df(fileobj_or_path):
+    df = pd.read_csv(fileobj_or_path)
+    if df.empty:
+        return None
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    return df
+
+
+def plot_and_save(df, profile, title, save_path):
+    t = df["timestamp"]
+    fig = PLOTTERS[profile](df, t, title)
+    fig.tight_layout()
+    fig.savefig(save_path, dpi=150)
+    plt.close(fig)
+    print(f"Saved {save_path}")
+
+
+def zip_run_name(zf, zip_path):
+    """Name for the run, e.g. 'Battery_118___Time_2026-07-30_16-09-29'.
+
+    Taken from the zip's single top-level folder if it has one, otherwise
+    falls back to the zip's own filename.
+    """
+    top_levels = {n.split("/")[0] for n in zf.namelist() if "/" in n}
+    if len(top_levels) == 1:
+        return top_levels.pop()
+    return os.path.splitext(os.path.basename(zip_path))[0]
+
+
+def process_zip(zip_path, outdir, profile_override):
+    target_dir = outdir or os.path.dirname(zip_path) or "."
+
+    with zipfile.ZipFile(zip_path) as zf:
+        save_dir = os.path.join(target_dir, zip_run_name(zf, zip_path))
+        os.makedirs(save_dir, exist_ok=True)
+
+        names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
+
+        targets = ZIP_TARGETS
+        if profile_override:
+            targets = [(needle, prof) for needle, prof in ZIP_TARGETS
+                      if prof == profile_override]
+
+        found_any = False
+        for needle, profile in targets:
+            matches = [n for n in names if needle in os.path.basename(n)]
+            if not matches:
+                print(f"No {needle} CSV found in {zip_path}, skipping")
+                continue
+            name = matches[0]
+            with zf.open(name) as f:
+                df = load_df(f)
+            if df is None:
+                print(f"No rows in {name}, skipping")
+                continue
+            found_any = True
+            title = f"{profile.capitalize()}: {os.path.basename(name)}"
+            save_path = os.path.join(save_dir, f"{needle}.png")
+            plot_and_save(df, profile, title, save_path)
+
+    if not found_any:
+        sys.exit(f"No matching CSVs found in {zip_path}")
+
+
+def process_csv(csv_path, save, profile_override):
+    profile = profile_override or detect_profile(csv_path)
+    if profile is None:
+        sys.exit(f"Cannot detect profile from filename {csv_path!r}; "
+                 f"use --profile {{{','.join(PROFILES)}}}")
+
+    df = load_df(csv_path)
+    if df is None:
+        sys.exit(f"No rows in {csv_path}")
+
+    title = f"{profile.capitalize()}: {csv_path}"
+    t = df["timestamp"]
+    fig = PLOTTERS[profile](df, t, title)
+    fig.tight_layout()
+
+    if save:
+        fig.savefig(save, dpi=150)
+        print(f"Saved {save}")
+    else:
+        plt.show()
+
 
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("csv", help="CSV file to plot")
-    ap.add_argument("--save", metavar="FILE", help="save figure to FILE instead of showing")
+    ap.add_argument("input", help="CSV file, or a run zip, to plot")
+    ap.add_argument("--save", metavar="FILE",
+                    help="save figure to FILE instead of showing (single CSV only)")
+    ap.add_argument("--outdir", metavar="DIR",
+                    help="target directory when input is a zip; a folder "
+                         "named after the run (battery + time) is created "
+                         "inside it and the graphs saved there (default "
+                         "target directory: next to the zip)")
     ap.add_argument("--profile", choices=PROFILES,
-                    help="run profile (default: detect from filename)")
+                    help="run profile (default: detect from filename; for a "
+                         "zip, restricts to just that profile's graph)")
     args = ap.parse_args()
 
-    profile = args.profile or detect_profile(args.csv)
-    if profile is None:
-        sys.exit(f"Cannot detect profile from filename {args.csv!r}; "
-                 f"use --profile {{{','.join(PROFILES)}}}")
-
-    df = pd.read_csv(args.csv)
-    if df.empty:
-        sys.exit(f"No rows in {args.csv}")
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    t = df["timestamp"]
-
-    title = f"{profile.capitalize()}: {args.csv}"
-    fig = PLOTTERS[profile](df, t, title)
-
-    fig.tight_layout()
-
-    if args.save:
-        fig.savefig(args.save, dpi=150)
-        print(f"Saved {args.save}")
+    if args.input.lower().endswith(".zip"):
+        process_zip(args.input, args.outdir, args.profile)
     else:
-        plt.show()
+        process_csv(args.input, args.save, args.profile)
 
 
 if __name__ == "__main__":

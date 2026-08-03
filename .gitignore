@@ -2,3 +2,6 @@
 /solar-battery-tester
 /solar-battery-tester.pdf
 /datasheets
+*.zip
+*.png
+*.json
