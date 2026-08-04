@@ -28,6 +28,7 @@ import argparse
 import os
 import sys
 import zipfile
+from collections import namedtuple
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -35,9 +36,32 @@ import pandas as pd
 
 PROFILES = ("discharge", "charge", "monitor")
 
+TEMP_COLS = ["tempAHT_C", "tempBQ76920_C", "tempBQ25798_C"]
+CELL_COLS = ["cell1_mV", "cell2_mV", "cell3_mV"]
+
+# A single pass/fail check against a run's measured value.
+Check = namedtuple("Check", ["name", "passed", "measured", "limit"])
+
 # Number of readings averaged for the smoothed trace (and the start/end
 # voltages in its legend) on the monitor profile's 6 h+ pack panel.
 SMOOTH_WINDOW = 600 # 10 minutes as reading every 10 seconds
+
+# Pass/fail limits used by charge_checks(), discharge_checks() and
+# monitor_checks() below. Tune these to adjust what counts as a pass.
+CHARGE_MAX_TEMP_C = 50
+CHARGE_MAX_DURATION_H = 10
+CHARGE_FINAL_PACK_V = 12.3
+CHARGE_FINAL_PACK_TOLERANCE_V = 0.1
+CHARGE_MAX_CELL_V = 4.15
+CHARGE_MIN_CAPACITY_MAH = 11500
+
+DISCHARGE_MAX_TEMP_C = 50
+DISCHARGE_MIN_CAPACITY_MAH = 11000
+DISCHARGE_MIN_CELL_V = 2.9
+DISCHARGE_PACK_SPREAD_THRESHOLD_MV = 10000 # only check cell spread while pack is above this
+DISCHARGE_MAX_CELL_SPREAD_MV = 70
+
+MONITOR_MAX_PACK_DROP_MV = 10
 
 FILENAME_PREFIXES = {
     "discharging": "discharge",
@@ -60,10 +84,118 @@ def discharged_mAh(df, t):
     return np.trapezoid(-df["HAT_mA_Out"], x=hours)
 
 
+def charge_checks(df, t, capacity):
+    max_temp = df[TEMP_COLS].max().max()
+    duration_h = (t.iloc[-1] - t.iloc[0]).total_seconds() / 3600
+    final_pack_v = df["vbat_mV"].iloc[-1] / 1000
+    max_cell_v = df[CELL_COLS].max().max() / 1000
+    return [
+        Check("Max temp", max_temp <= CHARGE_MAX_TEMP_C,
+              f"{max_temp:.1f} °C", f"<= {CHARGE_MAX_TEMP_C} °C"),
+        Check("Charge duration", duration_h <= CHARGE_MAX_DURATION_H,
+              f"{duration_h:.2f} h", f"<= {CHARGE_MAX_DURATION_H} h"),
+        Check("Final pack voltage",
+              abs(final_pack_v - CHARGE_FINAL_PACK_V) <= CHARGE_FINAL_PACK_TOLERANCE_V,
+              f"{final_pack_v:.3f} V",
+              f"{CHARGE_FINAL_PACK_V} ± {CHARGE_FINAL_PACK_TOLERANCE_V} V"),
+        Check("Max cell voltage", max_cell_v <= CHARGE_MAX_CELL_V,
+              f"{max_cell_v:.3f} V", f"<= {CHARGE_MAX_CELL_V} V"),
+        Check("Charged capacity", capacity >= CHARGE_MIN_CAPACITY_MAH,
+              f"{capacity:.0f} mAh", f">= {CHARGE_MIN_CAPACITY_MAH} mAh"),
+    ]
+
+
+def discharge_checks(df, t, capacity):
+    max_temp = df[TEMP_COLS].max().max()
+    min_cell_v = df[CELL_COLS].min().min() / 1000
+
+    above_threshold = df["vbat_mV"] > DISCHARGE_PACK_SPREAD_THRESHOLD_MV
+    pack_v_label = DISCHARGE_PACK_SPREAD_THRESHOLD_MV / 1000
+    if above_threshold.any():
+        spread_mV = (df.loc[above_threshold, CELL_COLS].max(axis=1)
+                     - df.loc[above_threshold, CELL_COLS].min(axis=1))
+        max_spread = spread_mV.max()
+        spread_check = Check(f"Cell spread (pack > {pack_v_label} V)",
+                             max_spread <= DISCHARGE_MAX_CELL_SPREAD_MV,
+                             f"{max_spread:.0f} mV",
+                             f"<= {DISCHARGE_MAX_CELL_SPREAD_MV} mV")
+    else:
+        spread_check = Check(f"Cell spread (pack > {pack_v_label} V)", True,
+                             f"n/a (pack never > {pack_v_label} V)",
+                             f"<= {DISCHARGE_MAX_CELL_SPREAD_MV} mV")
+
+    return [
+        Check("Max temp", max_temp <= DISCHARGE_MAX_TEMP_C,
+              f"{max_temp:.1f} °C", f"<= {DISCHARGE_MAX_TEMP_C} °C"),
+        Check("Discharged capacity", capacity >= DISCHARGE_MIN_CAPACITY_MAH,
+              f"{capacity:.0f} mAh", f">= {DISCHARGE_MIN_CAPACITY_MAH} mAh"),
+        Check("Min cell voltage", min_cell_v >= DISCHARGE_MIN_CELL_V,
+              f"{min_cell_v:.3f} V", f">= {DISCHARGE_MIN_CELL_V} V"),
+        spread_check,
+    ]
+
+
+def monitor_checks(delta_mV):
+    """delta_mV: 6h+ pack voltage change (end - start); None if no 6 h+ data."""
+    limit = f"drop <= {MONITOR_MAX_PACK_DROP_MV} mV"
+    if delta_mV is None:
+        return [Check("Pack drift (6 h+)", False, "no data after 6 h", limit)]
+    return [Check("Pack drift (6 h+)", delta_mV >= -MONITOR_MAX_PACK_DROP_MV,
+                  f"{delta_mV:+.1f} mV", limit)]
+
+
+def add_checks_axis(fig, gs, row):
+    """A row reserved for render_checks(), kept separate from any data panel."""
+    ax = fig.add_subplot(gs[row])
+    ax.set_xticks([])
+    ax.set_yticks([])
+    for spine in ax.spines.values():
+        spine.set_visible(False)
+    return ax
+
+
+def render_checks(ax, checks):
+    """Fill a dedicated checks axis (see add_checks_axis()) with a pass/fail
+    summary, and print the same to stdout.
+
+    Returns whether all checks passed.
+    """
+    overall_pass = all(c.passed for c in checks)
+    lines = [f"{'PASS' if c.passed else 'FAIL'}  {c.name}: {c.measured} (limit {c.limit})"
+             for c in checks]
+    text = "\n".join(lines)
+    ax.set_facecolor("honeydew" if overall_pass else "mistyrose")
+    ax.text(0.01, 0.5, text, transform=ax.transAxes, fontsize=8,
+            family="monospace", va="center", ha="left")
+
+    print(f"{'PASS' if overall_pass else 'FAIL'}:")
+    for line in lines:
+        print(f"  {line}")
+
+    return overall_pass
+
+
+def shade_failures(ax, t, mask, color="red", alpha=0.15):
+    """Shade the x-regions of ax where a failure mask (aligned with t) is True."""
+    mask = np.asarray(mask, dtype=bool)
+    if not mask.any():
+        return
+    idx = np.flatnonzero(mask)
+    breaks = np.flatnonzero(np.diff(idx) != 1)
+    starts = np.concatenate(([0], breaks + 1))
+    ends = np.concatenate((breaks, [len(idx) - 1]))
+    for s, e in zip(starts, ends):
+        ax.axvspan(t.iloc[idx[s]], t.iloc[idx[e]], color=color, alpha=alpha, zorder=0)
+
+
+def shade_panel(ax, color="#ffe0e0"):
+    """Tint a whole panel's background, for failures with no specific x-location."""
+    ax.set_facecolor(color)
+
+
 def temps_panel(ax, df, t):
     """Internal temperatures (°C) with 0/60 °C limit lines."""
-    for col, label in [("tempAHT_C", "AHT"), ("tempBQ76920_C", "BQ76920"),
-                       ("tempBQ25798_C", "BQ25798")]:
+    for col, label in zip(TEMP_COLS, ["AHT", "BQ76920", "BQ25798"]):
         ax.plot(t, df[col], label=label)
     ax.set_ylim(-5, 65)
     ax.axhline(0, color="red", linewidth=1)
@@ -101,11 +233,17 @@ def plot_discharge(df, t, title):
     capacity = discharged_mAh(df, t)
     print(f"Discharged capacity: {capacity:.0f} mAh")
 
-    fig, (ax_temp, ax_i, ax_pack, ax_cell, ax_dev) = plt.subplots(
-        5, 1, sharex=True, figsize=(12, 13))
-    fig.suptitle(f"{title}  —  {capacity:.0f} mAh")
+    fig = plt.figure(figsize=(12, 13.8))
+    gs = fig.add_gridspec(6, 1, height_ratios=[0.45, 1, 1, 1, 1, 1])
+    ax_checks = add_checks_axis(fig, gs, 0)
+    ax_temp = fig.add_subplot(gs[1])
+    ax_i = fig.add_subplot(gs[2], sharex=ax_temp)
+    ax_pack = fig.add_subplot(gs[3], sharex=ax_temp)
+    ax_cell = fig.add_subplot(gs[4], sharex=ax_temp)
+    ax_dev = fig.add_subplot(gs[5], sharex=ax_temp)
 
     temps_panel(ax_temp, df, t)
+    shade_failures(ax_temp, t, df[TEMP_COLS].max(axis=1) > DISCHARGE_MAX_TEMP_C)
 
     # --- Discharge current (mA -> A, flipped so discharge is positive) ---
     ax_i.plot(t, -df["HAT_mA_Out"] / 1000, label="HAT out")
@@ -113,9 +251,12 @@ def plot_discharge(df, t, title):
     ax_i.set_ylabel("Discharge (A)")
     ax_i.legend(loc="upper right", fontsize=8)
     ax_i.grid(True, alpha=0.3)
+    if capacity < DISCHARGE_MIN_CAPACITY_MAH:
+        shade_panel(ax_i)
 
     pack_panel(ax_pack, df, t)
     cells_panel(ax_cell, df, t)
+    shade_failures(ax_cell, t, df[CELL_COLS].min(axis=1) / 1000 < DISCHARGE_MIN_CELL_V)
 
     # --- Cell deviation from the average cell voltage (mV) ---
     # Beyond +/-75 mV the imbalance is not acceptable.
@@ -133,6 +274,16 @@ def plot_discharge(df, t, title):
     ax_dev.legend(loc="upper right", fontsize=8)
     ax_dev.grid(True, alpha=0.3)
 
+    # Cell spread while pack > threshold, matching discharge_checks()'s spread check.
+    above_threshold = df["vbat_mV"] > DISCHARGE_PACK_SPREAD_THRESHOLD_MV
+    spread_mV = df[cells].max(axis=1) - df[cells].min(axis=1)
+    shade_failures(ax_dev, t, above_threshold & (spread_mV > DISCHARGE_MAX_CELL_SPREAD_MV))
+
+    overall_pass = render_checks(ax_checks, discharge_checks(df, t, capacity))
+    status = "PASS" if overall_pass else "FAIL"
+    fig.suptitle(f"{title}  —  {capacity:.0f} mAh  [{status}]",
+                color="darkgreen" if overall_pass else "darkred")
+
     fig.autofmt_xdate()
     return fig
 
@@ -145,13 +296,13 @@ def plot_monitor(df, t, title):
     drift that follows. Those two panels have their own time axes, so only
     the temp/cell panels share an x-axis.
     """
-    fig = plt.figure(figsize=(12, 11))
-    gs = fig.add_gridspec(4, 1)
-    ax_temp = fig.add_subplot(gs[0])
-    ax_pack1 = fig.add_subplot(gs[1])
-    ax_pack2 = fig.add_subplot(gs[2])
-    ax_cell = fig.add_subplot(gs[3], sharex=ax_temp)
-    fig.suptitle(title)
+    fig = plt.figure(figsize=(12, 11.8))
+    gs = fig.add_gridspec(5, 1, height_ratios=[0.4, 1, 1, 1, 1])
+    ax_checks = add_checks_axis(fig, gs, 0)
+    ax_temp = fig.add_subplot(gs[1])
+    ax_pack1 = fig.add_subplot(gs[2])
+    ax_pack2 = fig.add_subplot(gs[3])
+    ax_cell = fig.add_subplot(gs[4], sharex=ax_temp)
 
     temps_panel(ax_temp, df, t)
 
@@ -159,9 +310,11 @@ def plot_monitor(df, t, title):
     early = t <= t.iloc[0] + pd.Timedelta(hours=6)
     pack_panel(ax_pack1, df[early], t[early], autorange=True)
     ax_pack1.set_ylabel("Pack 0-6 h (V)")
+    delta_mV = None
     if early.all():
         ax_pack2.text(0.5, 0.5, "no data after 6 h",
                       ha="center", va="center", transform=ax_pack2.transAxes)
+        shade_panel(ax_pack2)
     else:
         # Raw reading faded, with a rolling average on top. The legend
         # reports the settled drift: mean of the first SMOOTH_WINDOW
@@ -170,12 +323,15 @@ def plot_monitor(df, t, title):
         smooth = v.rolling(SMOOTH_WINDOW, center=True, min_periods=1).mean()
         start_v = v.iloc[:SMOOTH_WINDOW].mean()
         end_v = v.iloc[-SMOOTH_WINDOW:].mean()
+        delta_mV = (end_v - start_v) * 1000
         ax_pack2.plot(t[~early], v, color="C0", alpha=0.3, label="Vbat raw")
         ax_pack2.plot(t[~early], smooth, color="C0",
                       label=f"Vbat avg: {start_v:.3f} → {end_v:.3f} V "
-                            f"({(end_v - start_v) * 1000:+.0f} mV)")
+                            f"({delta_mV:+.0f} mV)")
         ax_pack2.legend(loc="upper right", fontsize=8)
         ax_pack2.grid(True, alpha=0.3)
+        if delta_mV < -MONITOR_MAX_PACK_DROP_MV:
+            shade_panel(ax_pack2)
     ax_pack2.set_ylabel("Pack 6 h+ (V)")
 
     cells_panel(ax_cell, df, t, autorange=True)
@@ -186,6 +342,11 @@ def plot_monitor(df, t, title):
     ax_temp.tick_params(labelbottom=False)
     for ax in (ax_pack1, ax_pack2, ax_cell):
         plt.setp(ax.get_xticklabels(), rotation=30, ha="right")
+
+    overall_pass = render_checks(ax_checks, monitor_checks(delta_mV))
+    status = "PASS" if overall_pass else "FAIL"
+    fig.suptitle(f"{title}  [{status}]",
+                color="darkgreen" if overall_pass else "darkred")
 
     return fig
 
@@ -212,11 +373,16 @@ def plot_charge(df, t, title):
     capacity = np.trapezoid(df["ibat_mA"], x=hours)
     print(f"Charged capacity (net into battery): {capacity:.0f} mAh")
 
-    fig, (ax_temp, ax_i, ax_v, ax_cell) = plt.subplots(
-        4, 1, sharex=True, figsize=(12, 11))
-    fig.suptitle(f"{title}  —  {capacity:.0f} mAh")
+    fig = plt.figure(figsize=(12, 11.8))
+    gs = fig.add_gridspec(5, 1, height_ratios=[0.45, 1, 1, 1, 1])
+    ax_checks = add_checks_axis(fig, gs, 0)
+    ax_temp = fig.add_subplot(gs[1])
+    ax_i = fig.add_subplot(gs[2], sharex=ax_temp)
+    ax_v = fig.add_subplot(gs[3], sharex=ax_temp)
+    ax_cell = fig.add_subplot(gs[4], sharex=ax_temp)
 
     temps_panel(ax_temp, df, t)
+    shade_failures(ax_temp, t, df[TEMP_COLS].max(axis=1) > CHARGE_MAX_TEMP_C)
 
     # --- Charge current (mA -> A), with charge phases as background ---
     status = df["chargingStatus"]
@@ -237,6 +403,8 @@ def plot_charge(df, t, title):
     labels += list(seen.keys())
     ax_i.legend(handles, labels, loc="center right", fontsize=8)
     ax_i.grid(True, alpha=0.3)
+    if capacity < CHARGE_MIN_CAPACITY_MAH:
+        shade_panel(ax_i)
 
     # --- Pack and input voltage (mV -> V), 12.6 V = 3s max charge voltage ---
     ax_v.plot(t, df["vbat_mV"] / 1000, label="Vbat")
@@ -246,6 +414,10 @@ def plot_charge(df, t, title):
     ax_v.set_ylabel("Pack (V)")
     ax_v.legend(loc="lower right", fontsize=8)
     ax_v.grid(True, alpha=0.3)
+    final_pack_v = df["vbat_mV"].iloc[-1] / 1000
+    if abs(final_pack_v - CHARGE_FINAL_PACK_V) > CHARGE_FINAL_PACK_TOLERANCE_V:
+        tail_start = int(len(t) * 0.95)
+        ax_v.axvspan(t.iloc[tail_start], t.iloc[-1], color="red", alpha=0.15, zorder=0)
 
     # --- Cell voltages (mV -> V), 4.2 V = max cell voltage ---
     for cell in ("cell1_mV", "cell2_mV", "cell3_mV"):
@@ -256,6 +428,18 @@ def plot_charge(df, t, title):
     ax_cell.set_xlabel("Time")
     ax_cell.legend(loc="lower right", fontsize=8)
     ax_cell.grid(True, alpha=0.3)
+    shade_failures(ax_cell, t, df[CELL_COLS].max(axis=1) / 1000 > CHARGE_MAX_CELL_V)
+
+    duration_h = (t.iloc[-1] - t.iloc[0]).total_seconds() / 3600
+    if duration_h > CHARGE_MAX_DURATION_H:
+        cutoff = t.iloc[0] + pd.Timedelta(hours=CHARGE_MAX_DURATION_H)
+        for ax in (ax_temp, ax_i, ax_v, ax_cell):
+            ax.axvspan(cutoff, t.iloc[-1], color="red", alpha=0.12, zorder=0)
+
+    overall_pass = render_checks(ax_checks, charge_checks(df, t, capacity))
+    check_status = "PASS" if overall_pass else "FAIL"
+    fig.suptitle(f"{title}  —  {capacity:.0f} mAh  [{check_status}]",
+                color="darkgreen" if overall_pass else "darkred")
 
     fig.autofmt_xdate()
     return fig
