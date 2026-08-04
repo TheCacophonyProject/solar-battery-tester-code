@@ -13,8 +13,9 @@ The profile is auto-detected from the CSV filename prefix
 
 Given a zip file (as produced for a battery run, containing
 full_charge_*.csv, full_discharge_*.csv and monitoring_*.csv among other
-files), the full charge, full discharge and monitoring graphs are extracted,
-plotted and saved to an output folder instead.
+files), the full charge, full discharge and monitoring graphs are extracted
+and combined side by side into a single 1920x1080 summary.png, saved to an
+output folder. Pass --profile to instead save just that one profile's graph.
 
 Usage:
     ./plot_results.py discharging_2026-07-02_10-30-00.csv
@@ -62,6 +63,10 @@ DISCHARGE_PACK_SPREAD_THRESHOLD_MV = 10000 # only check cell spread while pack i
 DISCHARGE_MAX_CELL_SPREAD_MV = 70
 
 MONITOR_MAX_PACK_DROP_MV = 10
+
+# Combined (charge/discharge/monitor side by side) zip summary image, at 1080p.
+COMBINED_DPI = 100
+COMBINED_FIGSIZE = (1920 / COMBINED_DPI, 1080 / COMBINED_DPI)
 
 FILENAME_PREFIXES = {
     "discharging": "discharge",
@@ -228,12 +233,13 @@ def cells_panel(ax, df, t, autorange=False):
     ax.grid(True, alpha=0.3)
 
 
-def plot_discharge(df, t, title):
+def plot_discharge(df, t, title, fig=None):
     """Discharge run: constant-current discharge through the HAT."""
     capacity = discharged_mAh(df, t)
     print(f"Discharged capacity: {capacity:.0f} mAh")
 
-    fig = plt.figure(figsize=(12, 13.8))
+    if fig is None:
+        fig = plt.figure(figsize=(12, 13.8))
     gs = fig.add_gridspec(6, 1, height_ratios=[0.45, 1, 1, 1, 1, 1])
     ax_checks = add_checks_axis(fig, gs, 0)
     ax_temp = fig.add_subplot(gs[1])
@@ -288,7 +294,7 @@ def plot_discharge(df, t, title):
     return fig
 
 
-def plot_monitor(df, t, title):
+def plot_monitor(df, t, title, fig=None):
     """Monitoring run: cells resting, watching how they settle.
 
     The pack voltage is split into two panels (first 6 hours / the rest) so
@@ -296,7 +302,8 @@ def plot_monitor(df, t, title):
     drift that follows. Those two panels have their own time axes, so only
     the temp/cell panels share an x-axis.
     """
-    fig = plt.figure(figsize=(12, 11.8))
+    if fig is None:
+        fig = plt.figure(figsize=(12, 11.8))
     gs = fig.add_gridspec(5, 1, height_ratios=[0.4, 1, 1, 1, 1])
     ax_checks = add_checks_axis(fig, gs, 0)
     ax_temp = fig.add_subplot(gs[1])
@@ -363,7 +370,7 @@ CHARGE_PHASE_COLORS = {
 }
 
 
-def plot_charge(df, t, title):
+def plot_charge(df, t, title, fig=None):
     """Charge run: CC/CV charging via the BQ25798.
 
     The charge current panel is shaded by chargingStatus so the CC -> CV
@@ -373,7 +380,8 @@ def plot_charge(df, t, title):
     capacity = np.trapezoid(df["ibat_mA"], x=hours)
     print(f"Charged capacity (net into battery): {capacity:.0f} mAh")
 
-    fig = plt.figure(figsize=(12, 11.8))
+    if fig is None:
+        fig = plt.figure(figsize=(12, 11.8))
     gs = fig.add_gridspec(5, 1, height_ratios=[0.45, 1, 1, 1, 1])
     ax_checks = add_checks_axis(fig, gs, 0)
     ax_temp = fig.add_subplot(gs[1])
@@ -477,6 +485,25 @@ def plot_and_save(df, profile, title, save_path):
     print(f"Saved {save_path}")
 
 
+def plot_combined(dfs, titles, save_path):
+    """Charge/discharge/monitor graphs side by side in one 1080p image.
+
+    dfs/titles: {profile: df/title}, for whichever profiles were found.
+    """
+    fig = plt.figure(figsize=COMBINED_FIGSIZE, layout="constrained")
+    subfigs = fig.subfigures(1, len(dfs))
+    if len(dfs) == 1:
+        subfigs = [subfigs]
+
+    for subfig, profile in zip(subfigs, dfs):
+        df = dfs[profile]
+        PLOTTERS[profile](df, df["timestamp"], titles[profile], fig=subfig)
+
+    fig.savefig(save_path, dpi=COMBINED_DPI)
+    plt.close(fig)
+    print(f"Saved {save_path}")
+
+
 def zip_run_name(zf, zip_path):
     """Name for the run, e.g. 'Battery_118___Time_2026-07-30_16-09-29'.
 
@@ -503,7 +530,8 @@ def process_zip(zip_path, outdir, profile_override):
             targets = [(needle, prof) for needle, prof in ZIP_TARGETS
                       if prof == profile_override]
 
-        found_any = False
+        dfs = {}
+        titles = {}
         for needle, profile in targets:
             matches = [n for n in names if needle in os.path.basename(n)]
             if not matches:
@@ -515,13 +543,19 @@ def process_zip(zip_path, outdir, profile_override):
             if df is None:
                 print(f"No rows in {name}, skipping")
                 continue
-            found_any = True
-            title = f"{profile.capitalize()}: {os.path.basename(name)}"
-            save_path = os.path.join(save_dir, f"{needle}.png")
-            plot_and_save(df, profile, title, save_path)
+            dfs[profile] = df
+            titles[profile] = f"{profile.capitalize()}: {os.path.basename(name)}"
 
-    if not found_any:
+    if not dfs:
         sys.exit(f"No matching CSVs found in {zip_path}")
+
+    if profile_override:
+        profile = profile_override
+        save_path = os.path.join(save_dir, f"{profile}.png")
+        plot_and_save(dfs[profile], profile, titles[profile], save_path)
+    else:
+        save_path = os.path.join(save_dir, "summary.png")
+        plot_combined(dfs, titles, save_path)
 
 
 def process_csv(csv_path, save, profile_override):
