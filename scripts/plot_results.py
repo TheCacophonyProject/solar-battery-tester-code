@@ -89,6 +89,25 @@ def discharged_mAh(df, t):
     return np.trapezoid(-df["HAT_mA_Out"], x=hours)
 
 
+def charged_mAh(df, t):
+    """Capacity into the pack: ibat_mA integrated over time."""
+    hours = (t - t.iloc[0]).dt.total_seconds() / 3600
+    return np.trapezoid(df["ibat_mA"], x=hours)
+
+
+def monitor_pack_drift_mV(df, t):
+    """6 h+ pack voltage change (end - start), smoothed over SMOOTH_WINDOW
+    readings at each end; None if there's no data past 6 h.
+    """
+    early = t <= t.iloc[0] + pd.Timedelta(hours=6)
+    if early.all():
+        return None
+    v = df.loc[~early, "vbat_mV"] / 1000
+    start_v = v.iloc[:SMOOTH_WINDOW].mean()
+    end_v = v.iloc[-SMOOTH_WINDOW:].mean()
+    return (end_v - start_v) * 1000
+
+
 def charge_checks(df, t, capacity):
     max_temp = df[TEMP_COLS].max().max()
     duration_h = (t.iloc[-1] - t.iloc[0]).total_seconds() / 3600
@@ -317,7 +336,7 @@ def plot_monitor(df, t, title, fig=None):
     early = t <= t.iloc[0] + pd.Timedelta(hours=6)
     pack_panel(ax_pack1, df[early], t[early], autorange=True)
     ax_pack1.set_ylabel("Pack 0-6 h (V)")
-    delta_mV = None
+    delta_mV = monitor_pack_drift_mV(df, t)
     if early.all():
         ax_pack2.text(0.5, 0.5, "no data after 6 h",
                       ha="center", va="center", transform=ax_pack2.transAxes)
@@ -330,7 +349,6 @@ def plot_monitor(df, t, title, fig=None):
         smooth = v.rolling(SMOOTH_WINDOW, center=True, min_periods=1).mean()
         start_v = v.iloc[:SMOOTH_WINDOW].mean()
         end_v = v.iloc[-SMOOTH_WINDOW:].mean()
-        delta_mV = (end_v - start_v) * 1000
         ax_pack2.plot(t[~early], v, color="C0", alpha=0.3, label="Vbat raw")
         ax_pack2.plot(t[~early], smooth, color="C0",
                       label=f"Vbat avg: {start_v:.3f} → {end_v:.3f} V "
@@ -376,8 +394,7 @@ def plot_charge(df, t, title, fig=None):
     The charge current panel is shaded by chargingStatus so the CC -> CV
     handover and termination are visible at a glance.
     """
-    hours = (t - t.iloc[0]).dt.total_seconds() / 3600
-    capacity = np.trapezoid(df["ibat_mA"], x=hours)
+    capacity = charged_mAh(df, t)
     print(f"Charged capacity (net into battery): {capacity:.0f} mAh")
 
     if fig is None:
