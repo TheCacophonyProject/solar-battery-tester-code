@@ -1,0 +1,26 @@
+[Unit]
+Description=Battery run summary web app (gunicorn)
+After=network.target
+
+[Service]
+Type=simple
+User=battery-summary
+Group=battery-summary
+WorkingDirectory=/opt/solar-battery-tester-code/scripts
+ExecStart=/opt/solar-battery-tester-code/scripts/.venv/bin/gunicorn \
+    -w 3 \
+    -b 127.0.0.1:8000 \
+    --timeout 120 \
+    webapp:app
+Restart=on-failure
+RestartSec=5
+
+# Hardening: this process only needs to read its own code/venv and talk to
+# 127.0.0.1:8000 -- it has no business touching the rest of the filesystem.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target
