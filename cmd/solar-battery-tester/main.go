@@ -31,7 +31,7 @@ import (
 )
 
 const (
-	dischargeTempLimitC   = 80.0 // °C - stop discharging above this temperature
+	// dischargeTempLimitC   = 80.0 // °C - stop discharging above this temperature
 	chargeTimeoutDuration = 12 * time.Hour
 	testDataDir           = "/var/lib/solar-battery-tester/data"
 	restVoltage           = 3.9 * 3 // Target voltage when charging to rest voltage, note that the voltage will settle below this when the charging is turned off.
@@ -336,10 +336,10 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, testDuration in
 	return nil
 }
 
-type voltageReading struct {
-	time    time.Time
-	voltage float64
-}
+// type voltageReading struct {
+// 	time    time.Time
+// 	voltage float64
+// }
 
 type testResults struct {
 	OCDPass          bool `json:"ocdPass"`

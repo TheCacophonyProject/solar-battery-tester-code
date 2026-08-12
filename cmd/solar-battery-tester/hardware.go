@@ -8,7 +8,6 @@ import (
 	"math/rand"
 	"os"
 	"path/filepath"
-	"slices"
 	"strconv"
 	"time"
 
@@ -20,14 +19,14 @@ import (
 
 // GPIO pin assignments from schematic (solar-battery-tester.kicad_sch).
 const (
-	pinChargeEn = "GPIO17"
-	pinEnShort  = "GPIO12"
-	pinEnFan    = "GPIO4"
-	// pinBatterySenseDigital = "GPIO7"
-	// pinAdcReady = "GPIO27"
-	pinLedR = "GPIO6"
-	pinLedG = "GPIO5"
-	pinLedB = "GPIO7"
+	pinChargeEn            = "GPIO17"
+	pinEnShort             = "GPIO12"
+	pinEnFan               = "GPIO4"
+	pinBatterySenseDigital = "GPIO7"
+	pinAdcReady            = "GPIO27"
+	pinLedR                = "GPIO6"
+	pinLedG                = "GPIO5"
+	pinLedB                = "GPIO7"
 
 	pinCCLoad1 = "GPIO21"
 	pinCCLoad2 = "GPIO26"
@@ -51,17 +50,15 @@ const (
 const battVoltDividerRatio = (2.2 + 330.0 + 100.0) / 100.0
 
 type hardware struct {
-	bus                 i2c.BusCloser
-	chargeEn            gpio.PinOut
-	enShort             gpio.PinOut
-	enFan               gpio.PinOut
-	batterySenseDigital gpio.PinIn
-	adcReady            gpio.PinIn
-	ledR                gpio.PinOut
-	ledG                gpio.PinOut
-	ledB                gpio.PinOut
-	ccLoads             [6]gpio.PinOut
-	ledChan             chan [3]led
+	bus      i2c.BusCloser
+	chargeEn gpio.PinOut
+	enShort  gpio.PinOut
+	enFan    gpio.PinOut
+	ledR     gpio.PinOut
+	ledG     gpio.PinOut
+	ledB     gpio.PinOut
+	ccLoads  [6]gpio.PinOut
+	ledChan  chan [3]led
 
 	chargeMonitor    *INA219
 	dischargeMonitor *INA219
@@ -383,93 +380,93 @@ func gpioLevel(high bool) gpio.Level {
 	return gpio.Low
 }
 
-func (hw *hardware) testCharge(battStateChan chan BatteryStatus) (bool, error) {
-	// Enable battery charging
-	if err := hw.setChargeEnable(true); err != nil {
-		log.Printf("Error setting charge enable: %v", err)
-	}
-	defer func() {
-		hw.setChargeEnable(false)
-	}()
+// func (hw *hardware) testCharge(battStateChan chan BatteryStatus) (bool, error) {
+// 	// Enable battery charging
+// 	if err := hw.setChargeEnable(true); err != nil {
+// 		log.Printf("Error setting charge enable: %v", err)
+// 	}
+// 	defer func() {
+// 		hw.setChargeEnable(false)
+// 	}()
 
-	log.Println("Waiting for battery status.")
-	<-battStateChan
+// 	log.Println("Waiting for battery status.")
+// 	<-battStateChan
 
-	// Get new status
-	log.Println("Waiting for battery status.")
-	batteryState := <-battStateChan
-	log.Infof("Battery status: %+v", batteryState)
+// 	// Get new status
+// 	log.Println("Waiting for battery status.")
+// 	batteryState := <-battStateChan
+// 	log.Infof("Battery status: %+v", batteryState)
 
-	const (
-		notCharging chargingStatus = iota
-		trickleCharge
-		preCharge
-		fastChargeCC
-		taperChargeCV
-		reserved
-		topOffTimerActivatedCharging
-		chargeTerminationDone
-	)
+// 	const (
+// 		notCharging chargingStatus = iota
+// 		trickleCharge
+// 		preCharge
+// 		fastChargeCC
+// 		taperChargeCV
+// 		reserved
+// 		topOffTimerActivatedCharging
+// 		chargeTerminationDone
+// 	)
 
-	validChargeState := []chargingStatus{
-		trickleCharge,
-		preCharge,
-		fastChargeCC,
-		taperChargeCV,
-		topOffTimerActivatedCharging,
-		chargeTerminationDone,
-	}
+// 	validChargeState := []chargingStatus{
+// 		trickleCharge,
+// 		preCharge,
+// 		fastChargeCC,
+// 		taperChargeCV,
+// 		topOffTimerActivatedCharging,
+// 		chargeTerminationDone,
+// 	}
 
-	// Check if valid charging state
-	validChargingState := slices.Contains(validChargeState, batteryState.chargingStatus)
-	if !validChargingState {
-		log.Infof("Battery is not in a valid charging state: %s", batteryState.chargingStatus)
-		return false, nil
-	}
+// 	// Check if valid charging state
+// 	validChargingState := slices.Contains(validChargeState, batteryState.chargingStatus)
+// 	if !validChargingState {
+// 		log.Infof("Battery is not in a valid charging state: %s", batteryState.chargingStatus)
+// 		return false, nil
+// 	}
 
-	// Check Power Good
-	if !batteryState.powerGood {
-		log.Info("Battery power is not good.")
-		return false, nil
-	}
+// 	// Check Power Good
+// 	if !batteryState.powerGood {
+// 		log.Info("Battery power is not good.")
+// 		return false, nil
+// 	}
 
-	log.Info("Battery is in a valid charging state.")
-	return true, nil
-}
+// 	log.Info("Battery is in a valid charging state.")
+// 	return true, nil
+// }
 
-func (hw *hardware) testDischarge(battStateChan chan BatteryStatus) (bool, error) {
-	log.Println("Waiting for battery status.")
-	<-battStateChan
+// func (hw *hardware) testDischarge(battStateChan chan BatteryStatus) (bool, error) {
+// 	log.Println("Waiting for battery status.")
+// 	<-battStateChan
 
-	hw.setCCLoads(2)
-	defer hw.setCCLoads(0)
+// 	hw.setCCLoads(2)
+// 	defer hw.setCCLoads(0)
 
-	// Get new status
-	log.Println("Waiting for battery status.")
-	batteryState := <-battStateChan
-	log.Infof("Battery status: %+v", batteryState)
+// 	// Get new status
+// 	log.Println("Waiting for battery status.")
+// 	batteryState := <-battStateChan
+// 	log.Infof("Battery status: %+v", batteryState)
 
-	voltage, current, err := hw.readDischargeMonitor()
-	if err != nil {
-		return false, fmt.Errorf("reading discharge monitor: %v", err)
-	}
-	log.Println(voltage, current)
+// 	voltage, current, err := hw.readDischargeMonitor()
+// 	if err != nil {
+// 		return false, fmt.Errorf("reading discharge monitor: %v", err)
+// 	}
+// 	log.Println(voltage, current)
 
-	current = math.Abs(current)
+// 	current = math.Abs(current)
 
-	if current < 0.9 {
-		log.Println("Current too low.")
-		return false, nil
-	}
-	if current > 1.1 {
-		log.Println("Current too high.")
-		return false, nil
-	}
+// 	if current < 0.9 {
+// 		log.Println("Current too low.")
+// 		return false, nil
+// 	}
+// 	if current > 1.1 {
+// 		log.Println("Current too high.")
+// 		return false, nil
+// 	}
 
-	log.Println("Passed discharge test.")
+// 	log.Println("Passed discharge test.")
 
-	return true, nil
-}
+// 	return true, nil
+// }
 
 // overCurrentDischargeTest will return true if the battery passes the test.
 func (hw *hardware) overCurrentDischargeTest(battStateChan chan BatteryStatus) (bool, error) {
@@ -817,7 +814,7 @@ func (hw *hardware) waitForCellsToBalance(battStateChan chan BatteryStatus, data
 			return fmt.Errorf("balance sequence timed out after 24 hours")
 		case <-time.After(time.Minute):
 			log.Info("Message taking too long, something is wrong.")
-			return errors.New("No more messages from battery")
+			return errors.New("no more messages from battery")
 		case batteryState := <-battStateChan:
 
 			hardwareState := hw.readSensors()
