@@ -34,6 +34,7 @@ from collections import namedtuple
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
+from matplotlib.patches import Patch
 
 PROFILES = ("discharge", "charge", "monitor")
 
@@ -218,14 +219,26 @@ def shade_panel(ax, color="#ffe0e0"):
 
 
 def temps_panel(ax, df, t):
-    """Internal temperatures (°C) with 0/60 °C limit lines."""
+    """Internal temperatures (°C) with 0/60 °C limit lines.
+
+    Shades periods where the battery manager's trace heater was on (older
+    CSVs without a heater_on column just skip the shading).
+    """
     for col, label in zip(TEMP_COLS, ["AHT", "BQ76920", "BQ25798"]):
         ax.plot(t, df[col], label=label)
     ax.set_ylim(-5, 65)
     ax.axhline(0, color="red", linewidth=1)
     ax.axhline(60, color="red", linewidth=1)
+
+    handles, labels = ax.get_legend_handles_labels()
+    if "heater_on" in df.columns:
+        shade_failures(ax, t, df["heater_on"], color="orange", alpha=0.2)
+        if df["heater_on"].any():
+            handles.append(Patch(facecolor="orange", alpha=0.2))
+            labels.append("Heater on")
+
     ax.set_ylabel("Temp (°C)")
-    ax.legend(loc="upper right", fontsize=8)
+    ax.legend(handles, labels, loc="upper right", fontsize=8)
     ax.grid(True, alpha=0.3)
 
 
@@ -490,6 +503,10 @@ def load_df(fileobj_or_path):
     if df.empty:
         return None
     df["timestamp"] = pd.to_datetime(df["timestamp"])
+    if "heater_on" in df.columns:
+        # Go's strconv.FormatBool writes lowercase "true"/"false", which pandas
+        # doesn't auto-coerce to bool, so normalize explicitly.
+        df["heater_on"] = df["heater_on"].astype(str).str.strip().str.lower() == "true"
     return df
 
 

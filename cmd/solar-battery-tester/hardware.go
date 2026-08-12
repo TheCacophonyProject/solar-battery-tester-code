@@ -969,6 +969,7 @@ func writeCSVState(hardwareState *hardwareState, batteryState BatteryStatus, wri
 		fmtI(int(batteryState.IbatmA)),       // ibat_mA
 		fmtI(int(batteryState.IbatCCmA)),     // ibatCC_mA
 		batteryState.chargingStatus.String(), // chargingStatus
+		fmtBool(batteryState.HeaterOn),       // heater_on
 	}
 	if err := writer.Write(row); err != nil {
 		log.Warnf("Writing CSV row: %v", err)
@@ -999,7 +1000,7 @@ func makeStateCSVWriter(dataDir, prefix string) (func(), *csv.Writer, error) {
 		"cell1_mV", "cell2_mV", "cell3_mV",
 		"vbus_mV", "vbat_mV",
 		"ibus_mA", "ibat_mA", "ibatCC_mA",
-		"chargingStatus",
+		"chargingStatus", "heater_on",
 	}
 	if err := w.Write(header); err != nil {
 		return nil, nil, fmt.Errorf("writing CSV header: %v", err)
@@ -1020,4 +1021,8 @@ func fmtF(f float64) string {
 
 func fmtI(i int) string {
 	return strconv.Itoa(i)
+}
+
+func fmtBool(b bool) string {
+	return strconv.FormatBool(b)
 }
