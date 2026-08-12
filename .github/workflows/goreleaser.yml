@@ -1,0 +1,16 @@
+---
+name: Go CI and Release
+
+on:
+  push:
+    branches:
+      - '**'
+    tags:
+      - '*'
+  pull_request:
+    branches:
+      - '**'
+
+jobs:
+  build:
+    uses: TheCacophonyProject/github-actions-templates/.github/workflows/go-ci-release.yml@v0.1.2
