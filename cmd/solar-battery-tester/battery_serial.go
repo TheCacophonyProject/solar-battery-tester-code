@@ -10,8 +10,8 @@ import (
 )
 
 // BatteryStatus holds the parsed 0x90 periodic status message from the ATtiny1616 battery manager.
-// Sent every 10 seconds at 9600 baud. Layout matches main.cpp serial writes (39 bytes, all
-// little-endian, no struct padding — identical to the Python struct "<HIhhhBHHHHHHhh5s4sB").
+// Sent every 10 seconds at 9600 baud. Layout matches main.cpp serial writes (40 bytes, all
+// little-endian, no struct padding — identical to the Python struct "<BHIhhhBHHHHHHhh5s4sB").
 type BatteryStatus struct {
 	BatteryID                uint16 // battery box ID read from the EEPROM (label on the box)
 	Seconds                  uint32 // time since boot (s)
@@ -30,6 +30,7 @@ type BatteryStatus struct {
 	ChgStat                  [5]byte // BQ25798 REG1B..REG1F (STATUS_0..4)
 	BQStat                   [4]byte // BQ76920: SYS_STAT, CELLBAL1, SYS_CTRL1, SYS_CTRL2
 	HeaterOn                 bool    // protectionState.isHeatingEnabled() on the battery manager
+	FWVersion                uint8   // firmware version packed as major*100 + minor*10 + patch
 	chargingStatus           chargingStatus
 	vbusStatus               vbusStatus
 	powerGood                bool
@@ -131,6 +132,11 @@ func (s *BatteryStatus) TempBQ76920() float64 { return float64(s.TempBQ76920dC) 
 func (s *BatteryStatus) TempBQ25798() float64 { return float64(s.TempBQ25798dC) / 10.0 }
 func (s *BatteryStatus) IsCharging() bool     { return s.IbatmA > 0 }
 
+// FirmwareVersion unpacks FWVersion (major*100 + minor*10 + patch) into "vX.Y.Z".
+func (s *BatteryStatus) FirmwareVersion() string {
+	return fmt.Sprintf("v%d.%d.%d", s.FWVersion/100, (s.FWVersion/10)%10, s.FWVersion%10)
+}
+
 // BQFaults returns BQ76920 SYS_STAT fault flags as human-readable strings.
 func (s *BatteryStatus) BQFaults() []string {
 	stat := s.BQStat[0]
@@ -153,7 +159,7 @@ func (s *BatteryStatus) BQFaults() []string {
 const (
 	batteryBaudRate         = 9600
 	batteryStatusCode       = 0x90
-	batteryStatusPayloadLen = 39 // bytes following the 0x90 code byte
+	batteryStatusPayloadLen = 40 // bytes following the 0x90 code byte
 	batteryStatusCRCLen     = 2  // CRC-16 trailing the payload (little-endian)
 )
 
@@ -297,37 +303,41 @@ func readFull(port *serial.Port, buf []byte, deadline time.Time) error {
 	return nil
 }
 
-// parseStatusPayload decodes the 39-byte 0x90 payload into a BatteryStatus.
-// All fields are little-endian with no padding (matches Python struct "<HIhhhBHHHHHHhh5s4sB").
+// parseStatusPayload decodes the 40-byte 0x90 payload into a BatteryStatus.
+// All fields are little-endian with no padding (matches Python struct "<BHIhhhBHHHHHHhh5s4sB").
 func parseStatusPayload(d []byte) (*BatteryStatus, error) {
 	if len(d) < batteryStatusPayloadLen {
 		return nil, fmt.Errorf("payload too short: %d bytes", len(d))
 	}
 	s := &BatteryStatus{}
-	s.BatteryID = binary.LittleEndian.Uint16(d[0:2])
-	s.Seconds = binary.LittleEndian.Uint32(d[2:6])
-	s.TempAHTdC = int16(binary.LittleEndian.Uint16(d[6:8]))
-	s.TempBQ76920dC = int16(binary.LittleEndian.Uint16(d[8:10]))
-	s.TempBQ25798dC = int16(binary.LittleEndian.Uint16(d[10:12]))
-	s.HumidityPct = d[12]
-	s.Cell1mV = binary.LittleEndian.Uint16(d[13:15])
-	s.Cell2mV = binary.LittleEndian.Uint16(d[15:17])
-	s.Cell3mV = binary.LittleEndian.Uint16(d[17:19])
-	s.VbusmV = binary.LittleEndian.Uint16(d[19:21])
-	s.IbusmA = binary.LittleEndian.Uint16(d[21:23])
-	s.VbatmV = binary.LittleEndian.Uint16(d[23:25])
-	s.IbatmA = int16(binary.LittleEndian.Uint16(d[25:27]))
-	s.IbatCCmA = int16(binary.LittleEndian.Uint16(d[27:29]))
-	copy(s.ChgStat[:], d[29:34])
-	copy(s.BQStat[:], d[34:38])
-	s.HeaterOn = d[38] != 0
-	s.chargingStatus = chargingStatus(d[30] >> 5)
-	s.vbusStatus = vbusStatus((d[30] >> 1) & 0x0F)
-	s.powerGood = bitHigh(d[29], 3)
-	s.chargerThermalRegulation = bitHigh(d[31], 2)
-	s.chargerVBatPresent = bitHigh(d[31], 0)
-	s.scd = bitHigh(d[34], 1)
-	s.ocd = bitHigh(d[34], 0)
+	s.FWVersion = d[0]
+	s.BatteryID = binary.LittleEndian.Uint16(d[1:3])
+	s.Seconds = binary.LittleEndian.Uint32(d[3:7])
+	s.TempAHTdC = int16(binary.LittleEndian.Uint16(d[7:9]))
+	s.TempBQ76920dC = int16(binary.LittleEndian.Uint16(d[9:11]))
+	s.TempBQ25798dC = int16(binary.LittleEndian.Uint16(d[11:13]))
+	s.HumidityPct = d[13]
+	s.Cell1mV = binary.LittleEndian.Uint16(d[14:16])
+	s.Cell2mV = binary.LittleEndian.Uint16(d[16:18])
+	s.Cell3mV = binary.LittleEndian.Uint16(d[18:20])
+	s.VbusmV = binary.LittleEndian.Uint16(d[20:22])
+	s.IbusmA = binary.LittleEndian.Uint16(d[22:24])
+	s.VbatmV = binary.LittleEndian.Uint16(d[24:26])
+	s.IbatmA = int16(binary.LittleEndian.Uint16(d[26:28]))
+	s.IbatCCmA = int16(binary.LittleEndian.Uint16(d[28:30]))
+	copy(s.ChgStat[:], d[30:35])
+	copy(s.BQStat[:], d[35:39])
+	s.HeaterOn = d[39] != 0
+
+	// Derived from the status registers copied above (BQ25798 REG1B..1F, BQ76920 SYS_STAT) rather
+	// than from raw payload offsets, so these stay correct if the layout shifts again.
+	s.chargingStatus = chargingStatus(s.ChgStat[1] >> 5)
+	s.vbusStatus = vbusStatus((s.ChgStat[1] >> 1) & 0x0F)
+	s.powerGood = bitHigh(s.ChgStat[0], 3)
+	s.chargerThermalRegulation = bitHigh(s.ChgStat[2], 2)
+	s.chargerVBatPresent = bitHigh(s.ChgStat[2], 0)
+	s.scd = bitHigh(s.BQStat[0], 1)
+	s.ocd = bitHigh(s.BQStat[0], 0)
 
 	return s, nil
 }
