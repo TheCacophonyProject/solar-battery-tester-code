@@ -34,8 +34,7 @@ const (
 	// dischargeTempLimitC   = 80.0 // °C - stop discharging above this temperature
 	chargeTimeoutDuration = 12 * time.Hour
 	testDataDir           = "/var/lib/solar-battery-tester/data"
-	restVoltage           = 3.9 * 3 // Target voltage when charging to rest voltage, note that the voltage will settle below this when the charging is turned off.
-	logRate               = 20 * time.Minute
+	logRate               = 10 * time.Minute
 )
 
 var log = logging.NewLogger("info")
@@ -56,6 +55,8 @@ type Args struct {
 	RunFullDischargeSeq *subcommandDuration `arg:"subcommand:run-full-discharge-seq" help:"Run the full discharge sequence and exit"`
 	RunMonitorSeq       *subcommandDuration `arg:"subcommand:run-monitor-seq" help:"Run the monitor sequence and exit"`
 	RunBalanceSeq       *subcommandDuration `arg:"subcommand:run-balance-seq" help:"Run the balance sequence and exit"`
+	RunStorageSeq       *subcommandStorage  `arg:"subcommand:run-storage-seq" help:"Run the storage sequence (settle at 20-30% SOC) and exit"`
+	CheckStorageState   *subcommandStorage  `arg:"subcommand:check-storage-state" help:"Check the pack is ready for storage or transport, without charging or discharging it"`
 
 	RunFullTests *subcommandDuration `arg:"subcommand:run-full-test" help:"Loop through running the full test sequence."`
 
@@ -68,6 +69,18 @@ type subcommand struct {
 
 type subcommandDuration struct {
 	Duration int `arg:"--duration" default:"0" help:"Option to limit the duration of a test sequence in minutes."`
+}
+
+// The storage window used when it isn't given on the command line. The defaults on the
+// flags below mirror these.
+const (
+	defaultSOCMinVolt = 10.2
+	defaultSOCMaxVolt = 10.5
+)
+
+type subcommandStorage struct {
+	SOCMinVolt float64 `arg:"--soc-min-voltage" default:"10.2" help:"Resting pack voltage at 20 percent SOC, the bottom of the storage window."`
+	SOCMaxVolt float64 `arg:"--soc-max-voltage" default:"10.5" help:"Resting pack voltage at 30 percent SOC, the top of the storage window."`
 }
 
 func (Args) Version() string {
@@ -195,10 +208,20 @@ func runMain() error {
 		return hw.waitForCellsToBalance(battStateChan, "./", args.RunBalanceSeq.Duration)
 	}
 
+	// Run Storage Sequence
+	if args.RunStorageSeq != nil {
+		return hw.runStorageSeq(battStateChan, "./", args.RunStorageSeq.SOCMinVolt, args.RunStorageSeq.SOCMaxVolt)
+	}
+
+	// Check the pack is ready for storage
+	if args.CheckStorageState != nil {
+		return hw.checkStorageState(battStateChan, args.CheckStorageState.SOCMinVolt, args.CheckStorageState.SOCMaxVolt)
+	}
+
 	if args.RunFullTests != nil {
 		for {
 			// Run full test
-			err := runFullTest(hw, battStateChan, args.RunFullTests.Duration)
+			err := runFullTest(hw, battStateChan, args)
 			if err != nil {
 				log.Errorf("Full test failed/errored: %v", err)
 				hw.flashLED(200, 0, 0)
@@ -219,9 +242,11 @@ func runMain() error {
 	return nil
 }
 
-func runFullTest(hw *hardware, battStateChan chan BatteryStatus, testDuration int) error {
+func runFullTest(hw *hardware, battStateChan chan BatteryStatus, args Args) error {
 	log.Info("=== Full Test Sequence Setup ===\n")
 	hw.solidLED(true, false, false)
+
+	testDuration := args.RunFullTests.Duration
 
 	log.Info("=== Waiting for USB device to be connected. ===")
 	usbMountPath, err := waitForUSBDrive()
@@ -307,8 +332,11 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, testDuration in
 	time.Sleep(time.Second)
 
 	step++
-	log.Infof("=== Step %d: Charging to rest voltage (%.1fV) ===", step, restVoltage)
-	if err := hw.runChargeSeq(battStateChan, restVoltage, resultsDir, "rest_charge", testDuration); err != nil {
+	log.Infof("=== Step %d: Charging to Storage voltage (20-30%% SOC) ===", step)
+	// Slightly tighter voltage range so it should pass after it has settled down.
+	minVolt := defaultSOCMinVolt + 0.2*(defaultSOCMaxVolt-defaultSOCMinVolt)
+	maxVolt := defaultSOCMaxVolt - 0.2*(defaultSOCMaxVolt-defaultSOCMinVolt)
+	if err := hw.runStorageSeq(battStateChan, resultsDir, minVolt, maxVolt); err != nil {
 		return fmt.Errorf("charge step failed: %v", err)
 	}
 	time.Sleep(time.Second)
@@ -319,6 +347,12 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, testDuration in
 		return fmt.Errorf("monitor step failed: %v", err)
 	}
 	time.Sleep(time.Second)
+
+	step++
+	log.Infof("=== Step %d: Check battery at proper storage voltage ===", step)
+	if err := hw.checkStorageState(battStateChan, defaultSOCMinVolt, defaultSOCMaxVolt); err != nil {
+		return fmt.Errorf("check storage state failed: %v", err)
+	}
 
 	log.Println("=== Results ===")
 	results.print()

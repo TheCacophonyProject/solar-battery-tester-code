@@ -9,6 +9,7 @@ import (
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"time"
 
 	"periph.io/x/conn/v3/gpio"
@@ -824,8 +825,7 @@ func (hw *hardware) waitForCellsToBalance(battStateChan chan BatteryStatus, data
 
 			// TODO: Wait until all the cells are all balanced
 
-			chargerReg := batteryState.BQStat[1]
-			if (chargerReg & 0x1F) == 0 {
+			if !cellsBalancing(batteryState) {
 				log.Info("All cells are balanced.")
 				return nil
 			}
@@ -920,6 +920,308 @@ func (hw *hardware) runDischargeSeq(battStateChan chan BatteryStatus, dataDir st
 			if hardwareState.dischargeVoltage < 1 {
 				log.Info("Discharge sequence complete.")
 				return nil
+			}
+		}
+	}
+}
+
+// Storage sequence tuning. A pack going into storage should sit at 20-30% SOC,
+// so the sequence aims for the middle of that window and accepts anything inside it.
+const (
+	// The pack is charged past the target because the cells read high while the
+	// charge current is flowing, so it settles back down once charging stops.
+	// If it settles too low the overshoot is stepped up and it is charged again.
+	storageChargeOvershoot = 1.0
+	storageChargeStep      = 0.2
+	storageChargeMaxVolt   = 12.0
+
+	// How long the pack is left with no charge and no load before its voltage
+	// is read as the resting voltage.
+	storageSettleDuration = 2 * time.Minute
+
+	// CC loads are shed one at a time as the pack hits the target so the
+	// discharge finishes at a low current. Stopping from a high current lets the
+	// voltage spring back well above the target once the load is removed.
+	storageDischargeCCLoads = 4
+
+	// Give up rather than cycling the pack forever if it will not settle.
+	storageMaxAttempts = 10
+
+	// How far a cell is allowed to sit outside its share of the pack storage window.
+	// The pack voltage on its own can't show a pack that is imbalanced, one cell high
+	// and another low, so the cells are checked as well before the pack is accepted.
+	storageCellTolerance = 0.05
+)
+
+// Cells in a pack, as read by the battery manager.
+const cellCount = 3
+
+// CELLBAL1 bits CB1..CB5, set while the BQ76920 is bleeding charge off a cell.
+const cellBalanceMask = 0x1F
+
+// cellsBalancing reports whether the BQ76920 is currently balancing any of the cells.
+func cellsBalancing(batteryState BatteryStatus) bool {
+	return batteryState.BQStat[1]&cellBalanceMask != 0
+}
+
+// runStorageSeq leaves the pack resting between socMinVolt and socMaxVolt (the
+// 20% and 30% SOC voltages). It charges to storageChargeOvershoot above the
+// middle of that window, lets the pack settle, and then either charges to a
+// slightly higher target or discharges back down to socMinVolt until the
+// settled voltage lands inside the window.
+func (hw *hardware) runStorageSeq(battStateChan chan BatteryStatus, dataDir string, socMinVolt, socMaxVolt float64) error {
+	if socMinVolt >= socMaxVolt {
+		return fmt.Errorf("invalid storage window: min voltage %.2fV is not below max voltage %.2fV", socMinVolt, socMaxVolt)
+	}
+
+	targetVoltage := (socMinVolt + socMaxVolt) / 2
+	chargeTarget := math.Min(targetVoltage+storageChargeOvershoot, storageChargeMaxVolt)
+
+	// Each cell should be sitting at its share of the pack window, give or take.
+	cellMinVolt := socMinVolt/cellCount - storageCellTolerance
+	cellMaxVolt := socMaxVolt/cellCount + storageCellTolerance
+
+	log.Infof("Running storage sequence, aiming for %.2fV resting (accepting %.2fV to %.2fV, cells %.3fV to %.3fV).",
+		targetVoltage, socMinVolt, socMaxVolt, cellMinVolt, cellMaxVolt)
+
+	if err := hw.runChargeSeq(battStateChan, chargeTarget, dataDir, "storage_charge", 0); err != nil {
+		return fmt.Errorf("storage charge failed: %v", err)
+	}
+
+	for attempt := 1; attempt <= storageMaxAttempts; attempt++ {
+		batteryState, err := hw.settleAndReadBattery(battStateChan, dataDir, fmt.Sprintf("storage_settle_%d", attempt))
+		if err != nil {
+			return err
+		}
+		restingVoltage := float64(batteryState.VbatmV) / 1000
+		cells := cellVoltages(batteryState)
+		log.Infof("Pack settled at %.2fV (cells %s).", restingVoltage, fmtCells(cells))
+
+		switch {
+		case restingVoltage < socMinVolt:
+			if chargeTarget >= storageChargeMaxVolt {
+				return fmt.Errorf("pack settled at %.2fV, below %.2fV, with the charge target already capped at %.1fV", restingVoltage, socMinVolt, storageChargeMaxVolt)
+			}
+			chargeTarget = math.Min(chargeTarget+storageChargeStep, storageChargeMaxVolt)
+			log.Infof("Below %.2fV. Charging again to %.2fV.", socMinVolt, chargeTarget)
+			if err := hw.runChargeSeq(battStateChan, chargeTarget, dataDir, "storage_charge", 0); err != nil {
+				return fmt.Errorf("storage charge failed: %v", err)
+			}
+
+		case restingVoltage > socMaxVolt:
+			log.Infof("Above %.2fV. Discharging to %.2fV.", socMaxVolt, socMinVolt)
+			if err := hw.dischargeToVoltage(battStateChan, dataDir, "storage_discharge", socMinVolt); err != nil {
+				return fmt.Errorf("storage discharge failed: %v", err)
+			}
+
+		default:
+			// The pack is at a storage voltage. Check the cells got there too, as a
+			// pack that only looks right in total shouldn't be put into storage.
+			if err := checkCellsInRange(cells, cellMinVolt, cellMaxVolt); err != nil {
+				return fmt.Errorf("pack rested at %.2fV but %v. The pack needs balancing", restingVoltage, err)
+			}
+			log.Infof("Storage sequence complete, pack resting at %.2fV.", restingVoltage)
+			return nil
+		}
+	}
+
+	return fmt.Errorf("pack did not settle between %.2fV and %.2fV after %d attempts", socMinVolt, socMaxVolt, storageMaxAttempts)
+}
+
+// checkStorageState validates that the pack is in the right state to be put into storage
+// or transported: the pack and its cells resting in the storage window, and the cells not
+// still balancing. It only reads the pack, it never charges or discharges it.
+func (hw *hardware) checkStorageState(battStateChan chan BatteryStatus, socMinVolt, socMaxVolt float64) error {
+	if socMinVolt >= socMaxVolt {
+		return fmt.Errorf("invalid storage window: min voltage %.2fV is not below max voltage %.2fV", socMinVolt, socMaxVolt)
+	}
+
+	// Make sure the pack isn't being charged or loaded while it is read, otherwise the
+	// voltage would be read higher or lower than the pack is actually sitting at.
+	if err := hw.setChargeEnable(false); err != nil {
+		return fmt.Errorf("setting charge enable: %v", err)
+	}
+	if err := hw.setCCLoads(0); err != nil {
+		return fmt.Errorf("setting CC loads: %v", err)
+	}
+
+	// The first status could have been read before the charger and loads were turned
+	// off, so it is discarded and the one after it is used.
+	batteryState := BatteryStatus{}
+	for range 2 {
+		select {
+		case batteryState = <-battStateChan:
+		case <-time.After(time.Minute):
+			return errors.New("no messages from battery")
+		}
+	}
+
+	packVoltage := float64(batteryState.VbatmV) / 1000
+	cells := cellVoltages(batteryState)
+	cellMinVolt := socMinVolt/cellCount - storageCellTolerance
+	cellMaxVolt := socMaxVolt/cellCount + storageCellTolerance
+
+	log.Infof("Pack is at %.2fV (cells %s).", packVoltage, fmtCells(cells))
+
+	// Report everything that is wrong with the pack, not just the first thing found.
+	problems := []string{}
+	if packVoltage < socMinVolt || packVoltage > socMaxVolt {
+		problems = append(problems, fmt.Sprintf("pack is at %.2fV, outside %.2fV to %.2fV", packVoltage, socMinVolt, socMaxVolt))
+	}
+	if err := checkCellsInRange(cells, cellMinVolt, cellMaxVolt); err != nil {
+		problems = append(problems, err.Error())
+	}
+	if cellsBalancing(batteryState) {
+		problems = append(problems, "the cells are still balancing")
+	}
+	if len(problems) > 0 {
+		return fmt.Errorf("pack is not ready for storage: %s", strings.Join(problems, "; "))
+	}
+
+	log.Info("Pack is ready for storage.")
+	return nil
+}
+
+// settleAndReadBattery turns off the charger and the CC loads, records the pack
+// for storageSettleDuration, and returns the last battery status of it.
+func (hw *hardware) settleAndReadBattery(battStateChan chan BatteryStatus, dataDir, prefix string) (BatteryStatus, error) {
+	if err := hw.setChargeEnable(false); err != nil {
+		return BatteryStatus{}, fmt.Errorf("setting charge enable: %v", err)
+	}
+	if err := hw.setCCLoads(0); err != nil {
+		return BatteryStatus{}, fmt.Errorf("setting CC loads: %v", err)
+	}
+
+	cleanup, writer, err := makeStateCSVWriter(dataDir, prefix)
+	if err != nil {
+		return BatteryStatus{}, err
+	}
+	defer cleanup()
+
+	log.Infof("Letting the pack settle for %s.", storageSettleDuration)
+	settled := time.After(storageSettleDuration)
+	lastState := BatteryStatus{}
+	gotState := false
+	for {
+		select {
+		case <-settled:
+			if !gotState {
+				return BatteryStatus{}, errors.New("no battery status received while settling")
+			}
+			return lastState, nil
+		case <-time.After(time.Minute):
+			log.Info("Message taking too long, something is wrong.")
+			return BatteryStatus{}, errors.New("no more messages from battery")
+		case batteryState := <-battStateChan:
+			hardwareState := hw.readSensors()
+			if err := writeCSVState(hardwareState, batteryState, writer); err != nil {
+				return BatteryStatus{}, err
+			}
+			lastState = batteryState
+			gotState = true
+		}
+	}
+}
+
+// cellVoltages returns the voltage of each cell in the pack.
+func cellVoltages(batteryState BatteryStatus) [cellCount]float64 {
+	return [cellCount]float64{
+		float64(batteryState.Cell1mV) / 1000,
+		float64(batteryState.Cell2mV) / 1000,
+		float64(batteryState.Cell3mV) / 1000,
+	}
+}
+
+func fmtCells(cells [cellCount]float64) string {
+	parts := make([]string, 0, cellCount)
+	for _, cell := range cells {
+		parts = append(parts, fmt.Sprintf("%.3fV", cell))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// checkCellsInRange returns an error naming any cell outside the given range.
+// The pack can rest inside the storage window with the cells out of range, one high and
+// another low, which charging or discharging the pack as a whole will not fix.
+func checkCellsInRange(cells [cellCount]float64, minVolt, maxVolt float64) error {
+	outOfRange := []string{}
+	for i, cell := range cells {
+		if cell < minVolt || cell > maxVolt {
+			outOfRange = append(outOfRange, fmt.Sprintf("cell %d at %.3fV", i+1, cell))
+		}
+	}
+	if len(outOfRange) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s, outside %.3fV to %.3fV", strings.Join(outOfRange, " and "), minVolt, maxVolt)
+}
+
+// dischargeToVoltage discharges the pack down to targetVoltage, shedding CC
+// loads as it gets close so the discharge finishes at a low current. This is the
+// same tapering idea as the full discharge: ending on a heavy load leaves the
+// voltage to spike back up well above the target once the load is removed.
+func (hw *hardware) dischargeToVoltage(battStateChan chan BatteryStatus, dataDir, filePrefix string, targetVoltage float64) error {
+	log.Printf("Discharging to %.2fV.", targetVoltage)
+	<-battStateChan
+
+	if err := hw.setChargeEnable(false); err != nil {
+		return fmt.Errorf("setting charge enable: %v", err)
+	}
+
+	ccLoads := storageDischargeCCLoads
+	if err := hw.setCCLoads(ccLoads); err != nil {
+		return fmt.Errorf("setting CC loads: %v", err)
+	}
+	defer func() {
+		if err := hw.setCCLoads(0); err != nil {
+			log.Errorf("setting CC loads: %v", err)
+		}
+	}()
+
+	cleanup, writer, err := makeStateCSVWriter(dataDir, filePrefix)
+	if err != nil {
+		return err
+	}
+	defer cleanup()
+
+	timeout := time.After(12 * time.Hour)
+	var lastReportTime time.Time
+	for {
+		select {
+		case <-timeout:
+			return fmt.Errorf("discharge to %.2fV timed out after 12 hours", targetVoltage)
+		case <-time.After(time.Minute):
+			log.Info("Message taking too long, something is wrong.")
+			return errors.New("no more messages from battery")
+		case batteryState := <-battStateChan:
+
+			hardwareState := hw.readSensors()
+			if err := writeCSVState(hardwareState, batteryState, writer); err != nil {
+				return err
+			}
+
+			packVoltage := float64(batteryState.VbatmV) / 1000
+
+			// Reading the target under load means the resting voltage is still
+			// above it by however much the load is pulling the pack down. Shed a
+			// load and carry on: the voltage lifts back above the target, and the
+			// pack only stops once it reaches the target on the lightest load.
+			if packVoltage <= targetVoltage {
+				if ccLoads > 1 {
+					ccLoads--
+					log.Infof("Pack reached %.2fV under load. Reducing discharge current to %.1fA and continuing.", packVoltage, 0.5*float64(ccLoads))
+					if err := hw.setCCLoads(ccLoads); err != nil {
+						return fmt.Errorf("setting CC loads: %v", err)
+					}
+				} else {
+					log.Infof("Reached %.2fV. Ending discharge.", packVoltage)
+					return nil
+				}
+			}
+
+			if time.Since(lastReportTime) > logRate {
+				lastReportTime = time.Now()
+				log.Printf("Discharging: %.2fV %.2fA", packVoltage, hardwareState.dischargeCurrent)
 			}
 		}
 	}
