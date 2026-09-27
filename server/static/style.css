@@ -31,6 +31,12 @@ a.button, button { font-size: 0.95rem; padding: 0.45rem 1rem; border: 1px solid 
 .muted { color: #666; font-size: 0.9rem; }
 .drop { border: 2px dashed #999; border-radius: 8px; padding: 1.5rem 1rem; text-align: center; }
 .error { color: #b00020; margin-top: 1rem; }
+/* Overrides the block display bare labels get, so the box sits beside its text. */
+label.option { display: inline-block; margin: 0.9rem 0 0; font-size: 0.9rem; }
+label.option input { margin-right: 0.35rem; vertical-align: middle; }
+/* A run shown but not kept: marked, so it can't be taken for one in the archive. */
+.notice { background: #fff7e0; border: 1px solid #e0c56a; border-radius: 6px;
+          padding: 0.6rem 0.8rem; margin: 1rem 0; font-size: 0.9rem; }
 
 table.results { border-collapse: collapse; margin: 0.75rem 0; font-size: 0.95rem; }
 table.results th { text-align: left; font-weight: 500; color: #555; padding: 0.2rem 1.5rem 0.2rem 0;

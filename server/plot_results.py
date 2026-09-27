@@ -535,7 +535,10 @@ def plot_combined(dfs, titles, save_path):
 
     fig.savefig(save_path, dpi=COMBINED_DPI)
     plt.close(fig)
-    print(f"Saved {save_path}")
+    # savefig takes a file object as readily as a path, which is how the web app
+    # draws a run it isn't storing. There's no name to report in that case.
+    if isinstance(save_path, (str, os.PathLike)):
+        print(f"Saved {save_path}")
 
 
 def zip_run_name(zf, zip_path):

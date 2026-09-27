@@ -18,6 +18,7 @@
       <select id="run" disabled><option value="">Pick a battery first</option></select>
     </div>
   </div>
+  <div id="notice"></div>
   <p id="detail" class="muted"></p>
   <div id="results"></div>
   <div class="summary" id="summary"></div>
@@ -33,10 +34,24 @@
   <form method="post" action="/upload" enctype="multipart/form-data">
     <div class="drop">
       <input type="file" name="zipfile" accept=".zip" required>
+      <br>
+      <label class="option"><input type="checkbox" name="discard" value="1">
+        Don’t keep it — just show me the result</label>
       <br><button type="submit">Upload and process</button>
     </div>
   </form>
+  <p class="muted">Tick “don’t keep it” for a zip you’re only checking: you get the same
+  verdict and the same plots, but nothing is stored — not under the battery, not anywhere
+  else — so it’s gone when you leave the page.</p>
   {% if error %}<p class="error">{{ error }}</p>{% endif %}
 </section>
 
+{% if preview %}
+<script>
+  // This run wasn't stored, so there's no URL to load it from: the upload's own
+  // response carries it. tojson escapes it for a script element.
+  window.PREVIEW = {{ preview|tojson }};
+  window.PREVIEW_IMAGE = {{ preview_image|tojson }};
+</script>
+{% endif %}
 <script src="{{ url_for('static', filename='app.js') }}"></script>

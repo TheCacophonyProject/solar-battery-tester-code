@@ -25,6 +25,8 @@ Each tester finishes a battery, zips the run locally, and posts it to `/runs`. T
 
 A run zip uploaded through the page's own form is filed in exactly the same way, so a run you have a zip of but the server doesn't -- one off a tester that was offline, say -- can be added by hand and is then browsable like any other.
 
+That form also has a **"don't keep it"** tick box, for a zip you only want to look at. The run is checked and plotted exactly as a stored one is, and shown the same way, but nothing is written down anywhere: the verdict and the plot come back in the response itself, and the page marks the run as not kept. Working through a stack of zips you don't mean to keep leaves the archive untouched, with nothing to clean up afterwards.
+
 ## 0. Prerequisites
 
 - A server with a public IP, reachable on ports 80 and 443 (check your cloud provider's firewall/security group, not just the server's own).
@@ -183,8 +185,12 @@ Every route is behind Basic Auth, so requests need credentials in addition to th
   # Store a run and get its verdict back (what the testers do)
   curl -u yourusername -F "zipfile=@run.zip" -F "battery_id=126" https://battery.example.com/runs
 
-  # Check a zip without storing it (the only route that stores nothing)
+  # Check a zip without storing it: JSON verdict, no plot
   curl -u yourusername -F "zipfile=@run.zip" https://battery.example.com/check
+
+  # What the page's "don't keep it" tick box does: the full result page, also
+  # storing nothing (the reply is HTML, so this is really a browser thing)
+  curl -u yourusername -F "zipfile=@run.zip" -F "discard=1" https://battery.example.com/upload
 
   # What is stored
   curl -u yourusername https://battery.example.com/api/batteries

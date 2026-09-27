@@ -6,6 +6,7 @@ const summary = document.getElementById("summary");
 const results = document.getElementById("results");
 const footer = document.getElementById("footer");
 const actions = document.getElementById("actions");
+const notice = document.getElementById("notice");
 
 function verdictHTML(overall) {
   return `<span class="verdict ${overall}">${overall}</span>`;
@@ -60,10 +61,7 @@ async function loadBatteries() {
 }
 
 async function loadRuns(batteryID) {
-  summary.innerHTML = "";
-  actions.innerHTML = "";
-  detail.textContent = "";
-  results.innerHTML = "";
+  clearRun();
   if (!batteryID) {
     runSel.innerHTML = '<option value="">Pick a battery first</option>';
     runSel.disabled = true;
@@ -153,15 +151,29 @@ function toggleFullScreen(img) {
   img.requestFullscreen().catch(() => window.open(img.src, "_blank"));
 }
 
-async function showRun(batteryID, run) {
+function clearRun() {
   summary.innerHTML = "";
   actions.innerHTML = "";
   detail.textContent = "";
   results.innerHTML = "";
-  if (!batteryID || !run) return;
+  notice.innerHTML = "";
+}
 
-  const res = await fetch(`/api/runs/${batteryID}/${run}`);
-  const meta = await res.json();
+// Drawing a run and fetching one are separate because a preview arrives with
+// the page: it was never stored, so there's nothing to fetch it back from and
+// its image is a data: URI rather than a route.
+function renderRun(meta, summaryURL, zipURL) {
+  clearRun();
+
+  // Says plainly that this one isn't in the archive. A preview looks exactly
+  // like a stored run otherwise, and leaving the page is the last chance to
+  // save it.
+  if (meta.preview) {
+    notice.innerHTML = '<div class="notice"><strong>Not kept.</strong> Nothing about ' +
+      'this run was stored: it isn’t filed under Battery ' +
+      `${escapeHTML(meta.battery_id)}, and leaving this page loses it. Upload the zip ` +
+      'again with the box unticked to keep it.</div>';
+  }
 
   // The checks the server ran. What the tester itself found is in the table
   // below, rather than being half-repeated here.
@@ -175,10 +187,14 @@ async function showRun(batteryID, run) {
     summary.innerHTML = '<p class="muted">This run has no charge, discharge or monitor ' +
       'readings to plot — it stopped before they were recorded. The raw zip still has ' +
       'whatever it did record.</p>';
+  } else if (!summaryURL) {
+    // Only a preview gets here: its plot is drawn once, into the page, so a
+    // render that failed has no second chance the way a stored run's does.
+    summary.innerHTML = '<p class="error">Couldn\'t draw the summary for this run.</p>';
   } else {
     summary.innerHTML = '<p class="muted">Drawing the summary…</p>';
     const img = new Image();
-    img.alt = `Summary plots for ${run}`;
+    img.alt = `Summary plots for ${meta.run}`;
     img.onload = () => { summary.innerHTML = ""; summary.appendChild(img); };
     img.onerror = () => {
       summary.innerHTML = '<p class="error">Couldn\'t draw the summary for this run. ' +
@@ -186,13 +202,27 @@ async function showRun(batteryID, run) {
     };
     img.title = "Click to view full screen";
     img.addEventListener("click", () => toggleFullScreen(img));
-    img.src = `/runs/${batteryID}/${run}/summary.png`;
+    img.src = summaryURL;
   }
-  actions.innerHTML =
-    `<a class="button" href="/runs/${batteryID}/${run}/zip">Download raw zip</a>` +
-    (Object.keys(meta.profiles || {}).length
-      ? ` <a class="button" href="/runs/${batteryID}/${run}/summary.png" download>Download image</a>`
-      : "");
+
+  // A preview has no zip to offer: it wasn't stored, and you have the one you
+  // uploaded. The image is worth offering either way -- a data: URI downloads
+  // like any other href, given a name to save it under.
+  const buttons = [];
+  if (zipURL) buttons.push(`<a class="button" href="${zipURL}">Download raw zip</a>`);
+  if (summaryURL && Object.keys(meta.profiles || {}).length) {
+    buttons.push(`<a class="button" href="${summaryURL}" ` +
+      `download="${escapeHTML(meta.run)}.png">Download image</a>`);
+  }
+  actions.innerHTML = buttons.join(" ");
+}
+
+async function showRun(batteryID, run) {
+  clearRun();
+  if (!batteryID || !run) return;
+  const res = await fetch(`/api/runs/${batteryID}/${run}`);
+  renderRun(await res.json(), `/runs/${batteryID}/${run}/summary.png`,
+            `/runs/${batteryID}/${run}/zip`);
 }
 
 batteryFilter.addEventListener("input", renderBatteries);
@@ -203,6 +233,12 @@ runSel.addEventListener("change", () => showRun(batterySel.value, runSel.value))
 // stored instead of leaving it to be hunted for in the dropdowns.
 async function start() {
   await loadBatteries();
+  // An upload that wasn't kept came back embedded in this page rather than as a
+  // ?battery=&run= to open, because there's nothing stored to open.
+  if (window.PREVIEW) {
+    renderRun(window.PREVIEW, window.PREVIEW_IMAGE, null);
+    return;
+  }
   const params = new URLSearchParams(location.search);
   const battery = params.get("battery");
   const run = params.get("run");

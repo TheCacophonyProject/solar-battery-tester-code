@@ -13,6 +13,7 @@ Endpoints:
   GET  /                                  browse the stored runs, or upload a zip by hand
   POST /runs        (form "zipfile")      store a run and return its JSON verdict
   POST /upload      (form "zipfile")      the page's form: stores the run, then shows it
+                    (form "discard")      ...or, with this set, shows it and stores nothing
   POST /check       (form "zipfile")      one-off: JSON {"overall": "PASS"/"FAIL", ...}, nothing stored
   GET  /api/batteries                     battery IDs that have runs stored
   GET  /api/batteries/<id>/runs           the runs stored for one battery
@@ -28,6 +29,7 @@ Usage:
 """
 
 import argparse
+import base64
 import io
 import json
 import os
@@ -267,35 +269,22 @@ def run_identity(zip_name, results):
     return battery_id, tester, run_name
 
 
-def store_run(raw, run_name, battery_id, tester, results, verdict):
+def store_run(raw, meta):
     """Write the zip and its metadata into the archive, replacing any run of the
     same name (a tester re-offers a run it isn't sure the server took).
     """
+    battery_id, run_name = meta["battery_id"], meta["run"]
     os.makedirs(battery_dir(battery_id), exist_ok=True)
     zip_path, meta_path, png_path = run_paths(battery_id, run_name)
 
     with open(zip_path, "wb") as f:
         f.write(raw)
-
-    meta = dict(verdict)
-    meta.update({
-        "run": run_name,
-        "battery_id": battery_id,
-        "tester": tester,
-        "uploaded": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-        "time": run_time(run_name),
-        "size": len(raw),
-        # Kept as the tester wrote it: this is the run's own account of itself,
-        # and the page shows it as it stands.
-        "results": results,
-    })
     with open(meta_path, "w") as f:
         json.dump(meta, f, indent=2)
 
     # A stale image from a replaced run would otherwise be served forever.
     if os.path.exists(png_path):
         os.remove(png_path)
-    return meta
 
 
 def render_summary(dfs, titles, png_path):
@@ -423,7 +412,8 @@ def upload():
     """The page's upload form: store the run, then show it in the browser.
 
     This files the run exactly as a tester's POST to /runs does -- a zip
-    uploaded here is one you can come back to later.
+    uploaded here is one you can come back to later. With "discard" ticked it
+    goes to preview_page() instead: same verdict, same plots, nothing stored.
     """
     zf, filename, raw, err = get_uploaded_zip()
     if err:
@@ -431,7 +421,10 @@ def upload():
 
     with zf:
         results = read_results_json(zf)
-        stored, err = keep_run(raw, zf, plot_results.zip_run_name(zf, filename), results)
+        zip_name = plot_results.zip_run_name(zf, filename)
+        if request.form.get("discard"):
+            return preview_page(raw, zf, zip_name, results)
+        stored, err = keep_run(raw, zf, zip_name, results)
         if err:
             return error_page(err)
 
@@ -453,15 +446,17 @@ def check():
     return jsonify(verdict_for_dfs(dfs, run_name))
 
 
-def keep_run(raw, zf, zip_name, results):
-    """File a run under its battery and check it, whoever sent it.
+def assess_run(raw, zf, zip_name, results):
+    """What a zip turns out to be and how it did, writing nothing down.
 
-    Returns (metadata, None), or (None, why it couldn't be filed).
+    Returns (metadata, dfs, titles, None), or (None, None, None, why it
+    couldn't be filed). A run that's being kept and one that's only being
+    looked at both come through here, so the two can't drift apart.
     """
     battery_id, tester, run_name = run_identity(zip_name, results)
     if battery_id is None:
         # run_name carries the reason when the identity couldn't be worked out.
-        return None, f"Couldn't file this run: {run_name}."
+        return None, None, None, f"Couldn't file this run: {run_name}."
 
     dfs, titles = extract_dfs(zf)
     if not dfs:
@@ -472,19 +467,70 @@ def keep_run(raw, zf, zip_name, results):
     else:
         verdict = verdict_for_dfs(dfs, run_name)
 
+    meta = dict(verdict)
+    meta.update({
+        "run": run_name,
+        "battery_id": battery_id,
+        "tester": tester,
+        "uploaded": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "time": run_time(run_name),
+        "size": len(raw),
+        # Kept as the tester wrote it: this is the run's own account of itself,
+        # and the page shows it as it stands.
+        "results": results,
+    })
+    return meta, dfs, titles, None
 
-    meta = store_run(raw, run_name, battery_id, tester, results, verdict)
+
+def keep_run(raw, zf, zip_name, results):
+    """File a run under its battery and check it, whoever sent it.
+
+    Returns (metadata, None), or (None, why it couldn't be filed).
+    """
+    meta, dfs, titles, err = assess_run(raw, zf, zip_name, results)
+    if err:
+        return None, err
+
+    store_run(raw, meta)
 
     # Drawn now rather than on first view: a stored run is complete on disk, and
     # opening it doesn't wait on matplotlib.
     if dfs:
-        _, _, png_path = run_paths(battery_id, run_name)
+        _, _, png_path = run_paths(meta["battery_id"], meta["run"])
         try:
             render_summary(dfs, titles, png_path)
         except Exception as e:
             # The run itself is safely stored; the image can be drawn later.
             app.logger.warning("Rendering %s: %s", png_path, e)
     return meta, None
+
+
+def preview_page(raw, zf, zip_name, results):
+    """Check a run and show it without keeping any part of it.
+
+    The verdict and the plot go back in the response itself, the image as a
+    data: URI in the page -- so nothing reaches the disk and there's nothing to
+    expire, sweep or back up. The zip isn't offered back because you have it:
+    you just uploaded it.
+    """
+    meta, dfs, titles, err = assess_run(raw, zf, zip_name, results)
+    if err:
+        return error_page(err)
+    meta["preview"] = True # what the page marks "not kept" from
+
+    image = ""
+    if dfs:
+        # savefig() takes a file object as readily as a path, and writes PNG by
+        # default, so the plot never needs a file of its own.
+        buf = io.BytesIO()
+        try:
+            plot_results.plot_combined(dfs, titles, buf)
+            image = "data:image/png;base64," + base64.b64encode(buf.getvalue()).decode()
+        except Exception as e:
+            # The verdict and the results table are still worth showing.
+            app.logger.warning("Drawing preview of %s: %s", meta["run"], e)
+
+    return render_template("index.html", preview=meta, preview_image=image)
 
 
 @app.post("/runs")
