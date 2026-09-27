@@ -1,0 +1,42 @@
+body { font-family: system-ui, sans-serif; max-width: 60rem; margin: 3rem auto; padding: 0 1rem;
+       color: #1a1a1a; }
+h1 { font-size: 1.4rem; }
+h2 { font-size: 1.05rem; margin-top: 2.5rem; }
+section { border-top: 1px solid #ddd; padding-top: 0.5rem; }
+.pickers { display: flex; gap: 1rem; flex-wrap: wrap; align-items: flex-end; margin: 1rem 0; }
+label { display: block; font-size: 0.85rem; color: #555; margin-bottom: 0.25rem; }
+select, input[type=search] { font-size: 1rem; padding: 0.4rem; min-width: 16rem; }
+input[type=search] { margin-bottom: 0.35rem; display: block; }
+.verdict { font-weight: 600; }
+.PASS { color: #0a7d33; }
+.FAIL { color: #b00020; }
+.summary { margin-top: 1rem; }
+.summary img { width: 100%; border: 1px solid #ddd; border-radius: 6px; cursor: zoom-in; }
+
+/* Full screen: fit the whole plot on the screen, on white so the traces read
+   the same as they do in the page. Written as separate rules because one
+   unknown selector would drop the whole list in browsers that don't know it. */
+.summary img:fullscreen {
+  width: 100%; height: 100%; object-fit: contain;
+  background: #fff; border: 0; border-radius: 0; cursor: zoom-out;
+}
+.summary img:-webkit-full-screen {
+  width: 100%; height: 100%; object-fit: contain;
+  background: #fff; border: 0; border-radius: 0; cursor: zoom-out;
+}
+.actions { margin-top: 0.75rem; }
+a.button, button { font-size: 0.95rem; padding: 0.45rem 1rem; border: 1px solid #999;
+                   border-radius: 6px; background: #f6f6f6; color: #1a1a1a;
+                   text-decoration: none; cursor: pointer; display: inline-block; }
+.muted { color: #666; font-size: 0.9rem; }
+.drop { border: 2px dashed #999; border-radius: 8px; padding: 1.5rem 1rem; text-align: center; }
+.error { color: #b00020; margin-top: 1rem; }
+
+table.results { border-collapse: collapse; margin: 0.75rem 0; font-size: 0.95rem; }
+table.results th { text-align: left; font-weight: 500; color: #555; padding: 0.2rem 1.5rem 0.2rem 0;
+                   vertical-align: top; white-space: nowrap; }
+table.results td { padding: 0.2rem 0; }
+details { font-size: 0.9rem; color: #666; }
+details summary { cursor: pointer; }
+details pre { background: #f6f6f6; border: 1px solid #ddd; border-radius: 6px;
+              padding: 0.75rem; overflow-x: auto; color: #1a1a1a; }

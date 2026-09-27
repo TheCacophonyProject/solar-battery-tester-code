@@ -1,0 +1,43 @@
+# Configuration for the solar battery tester.
+#
+# Installed alongside the real thing as
+# /etc/solar-battery-tester/config.toml.example. To point a tester at a server,
+# fill in /etc/solar-battery-tester/config.toml (the package creates it with
+# empty values) and restart the service:
+#
+#     sudo nano /etc/solar-battery-tester/config.toml
+#     sudo solar-battery-tester check-server         # does this file work?
+#     sudo systemctl restart solar-battery-tester
+#     sudo journalctl -u solar-battery-tester -f     # "Runs will be uploaded to ..."
+#
+# Running the tester by hand reads the same file, so there is nothing to load
+# into the environment first:
+#
+#     sudo solar-battery-tester run-full-test
+#     sudo solar-battery-tester --config ./my-config.toml run-full-test
+#
+# The password is in plain text here, so config.toml is readable only by root.
+# Testers should have their own account on the server rather than sharing
+# someone's browser login:
+#
+#     sudo htpasswd /etc/nginx/.htpasswd tester      # on the server, no -c
+
+[server]
+# Leaving url empty is a valid setup: the tester still runs and still writes
+# every run to /var/lib/solar-battery-tester/data, and the runs waiting there
+# are uploaded at the start of the next test once a url is set.
+url = "https://battery.example.com"
+
+# Only needed when the server isn't on its address's usual port -- a webapp on
+# the bench, say. These two are the same thing:
+#
+#     url = "http://10.1.5.86"
+#     port = 5000
+#
+#     url = "http://10.1.5.86:5000"
+#
+# An address written without http:// or https:// is taken as http://.
+# port = 5000
+
+username = "tester"
+password = "hunter2"

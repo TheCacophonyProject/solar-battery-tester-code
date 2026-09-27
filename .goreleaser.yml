@@ -15,7 +15,7 @@ builds:
       - arm64
     goarm:
       - "7"
-    main: ./cmd/solar-battery-tester
+    main: ./client/cmd/solar-battery-tester
     ldflags: -s -w -X main.version={{.Version}}
     binary: solar-battery-tester
 
@@ -30,10 +30,12 @@ nfpms:
       - deb
     bindir: /usr/bin
     contents:
-      - src: _release/solar-battery-tester.service
+      - src: client/_release/solar-battery-tester.service
         dst: /etc/systemd/system/solar-battery-tester.service
+      - src: client/_release/config.toml.example
+        dst: /etc/solar-battery-tester/config.toml.example
     scripts:
-      postinstall: "_release/postinstall.sh"
+      postinstall: "client/_release/postinstall.sh"
 checksum:
   name_template: '{{ .ProjectName }}_{{ .Version }}_checksums.txt'
 dist: dist

@@ -969,7 +969,7 @@ func cellsBalancing(batteryState BatteryStatus) bool {
 // middle of that window, lets the pack settle, and then either charges to a
 // slightly higher target or discharges back down to socMinVolt until the
 // settled voltage lands inside the window.
-func (hw *hardware) runStorageSeq(battStateChan chan BatteryStatus, dataDir string, socMinVolt, socMaxVolt float64) error {
+func (hw *hardware) runStorageSeq(battStateChan chan BatteryStatus, dataDir string, socMinVolt, socMaxVolt float64, duration int) error {
 	if socMinVolt >= socMaxVolt {
 		return fmt.Errorf("invalid storage window: min voltage %.2fV is not below max voltage %.2fV", socMinVolt, socMaxVolt)
 	}
@@ -989,9 +989,12 @@ func (hw *hardware) runStorageSeq(battStateChan chan BatteryStatus, dataDir stri
 	}
 
 	for attempt := 1; attempt <= storageMaxAttempts; attempt++ {
-		batteryState, err := hw.settleAndReadBattery(battStateChan, dataDir, fmt.Sprintf("storage_settle_%d", attempt))
+		batteryState, earlyExit, err := hw.settleAndReadBattery(battStateChan, dataDir, fmt.Sprintf("storage_settle_%d", attempt), duration)
 		if err != nil {
 			return err
+		}
+		if earlyExit { // This is done when the duration was set to run a quick test.
+			return nil
 		}
 		restingVoltage := float64(batteryState.VbatmV) / 1000
 		cells := cellVoltages(batteryState)
@@ -1084,19 +1087,24 @@ func (hw *hardware) checkStorageState(battStateChan chan BatteryStatus, socMinVo
 
 // settleAndReadBattery turns off the charger and the CC loads, records the pack
 // for storageSettleDuration, and returns the last battery status of it.
-func (hw *hardware) settleAndReadBattery(battStateChan chan BatteryStatus, dataDir, prefix string) (BatteryStatus, error) {
+func (hw *hardware) settleAndReadBattery(battStateChan chan BatteryStatus, dataDir, prefix string, duration int) (BatteryStatus, bool, error) {
 	if err := hw.setChargeEnable(false); err != nil {
-		return BatteryStatus{}, fmt.Errorf("setting charge enable: %v", err)
+		return BatteryStatus{}, false, fmt.Errorf("setting charge enable: %v", err)
 	}
 	if err := hw.setCCLoads(0); err != nil {
-		return BatteryStatus{}, fmt.Errorf("setting CC loads: %v", err)
+		return BatteryStatus{}, false, fmt.Errorf("setting CC loads: %v", err)
 	}
 
 	cleanup, writer, err := makeStateCSVWriter(dataDir, prefix)
 	if err != nil {
-		return BatteryStatus{}, err
+		return BatteryStatus{}, false, err
 	}
 	defer cleanup()
+
+	timeout := time.After(12 * time.Hour)
+	if duration > 0 {
+		timeout = time.After(time.Duration(duration) * time.Minute)
+	}
 
 	log.Infof("Letting the pack settle for %s.", storageSettleDuration)
 	settled := time.After(storageSettleDuration)
@@ -1104,18 +1112,24 @@ func (hw *hardware) settleAndReadBattery(battStateChan chan BatteryStatus, dataD
 	gotState := false
 	for {
 		select {
+		case <-timeout:
+			if duration > 0 {
+				log.Info("Exiting discharge sequence early for quick test.")
+				return lastState, true, nil
+			}
+			return lastState, false, fmt.Errorf("charge sequence timed out after 12 hours")
 		case <-settled:
 			if !gotState {
-				return BatteryStatus{}, errors.New("no battery status received while settling")
+				return BatteryStatus{}, false, errors.New("no battery status received while settling")
 			}
-			return lastState, nil
+			return lastState, false, nil
 		case <-time.After(time.Minute):
 			log.Info("Message taking too long, something is wrong.")
-			return BatteryStatus{}, errors.New("no more messages from battery")
+			return BatteryStatus{}, false, errors.New("no more messages from battery")
 		case batteryState := <-battStateChan:
 			hardwareState := hw.readSensors()
 			if err := writeCSVState(hardwareState, batteryState, writer); err != nil {
-				return BatteryStatus{}, err
+				return BatteryStatus{}, false, err
 			}
 			lastState = batteryState
 			gotState = true

@@ -1,0 +1,17 @@
+[Unit]
+Description=Cacophony Project Solar Battery Tester
+# The tester checks the server at startup, so it waits for the network rather
+# than reporting a server that is fine as unreachable on every boot.
+Wants=network-online.target
+After=network-online.target multi-user.target
+
+[Service]
+# Where to post finished runs is read from the config file, which is also this
+# command's default --config path. With no file, or no url in it, runs are kept
+# in /var/lib/solar-battery-tester/data until one is set.
+ExecStart=/usr/bin/solar-battery-tester --config /etc/solar-battery-tester/config.toml run-full-test
+Restart=on-failure
+RestartSec=5s
+
+[Install]
+WantedBy=multi-user.target

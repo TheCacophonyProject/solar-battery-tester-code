@@ -159,7 +159,7 @@ Then:
 sudo systemctl daemon-reload
 sudo systemctl enable salt-minion
 ```
+
 (Leave it stopped for now — `firstboot-hostname.service` starts the chain on
 first real boot, since `salt-minion` won't pass its `ConditionPathExists`
 until `minion_id` exists.)
-

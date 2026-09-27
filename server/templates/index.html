@@ -1,0 +1,42 @@
+<!doctype html>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Battery test runs</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+<h1>Battery test runs</h1>
+
+<section>
+  <h2>Browse stored runs</h2>
+  <div class="pickers">
+    <div>
+      <label for="batteryFilter">Battery ID</label>
+      <input id="batteryFilter" type="search" placeholder="Search…" autocomplete="off">
+      <select id="battery" size="1"><option value="">Loading…</option></select>
+    </div>
+    <div>
+      <label for="run">Test</label>
+      <select id="run" disabled><option value="">Pick a battery first</option></select>
+    </div>
+  </div>
+  <p id="detail" class="muted"></p>
+  <div id="results"></div>
+  <div class="summary" id="summary"></div>
+  <div class="actions" id="actions"></div>
+  <p id="footer" class="muted"></p>
+</section>
+
+<section>
+  <h2>Upload a zip by hand</h2>
+  <p class="muted">Testers post their runs here automatically. Use this for a run you have
+  a zip of but the server doesn't — it's filed under its battery just the same, and shows
+  up in the dropdowns above.</p>
+  <form method="post" action="/upload" enctype="multipart/form-data">
+    <div class="drop">
+      <input type="file" name="zipfile" accept=".zip" required>
+      <br><button type="submit">Upload and process</button>
+    </div>
+  </form>
+  {% if error %}<p class="error">{{ error }}</p>{% endif %}
+</section>
+
+<script src="{{ url_for('static', filename='app.js') }}"></script>

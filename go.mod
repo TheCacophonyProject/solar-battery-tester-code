@@ -5,6 +5,7 @@ go 1.25.0
 require (
 	github.com/TheCacophonyProject/go-utils v0.1.3
 	github.com/alexflint/go-arg v1.4.3
+	github.com/pelletier/go-toml/v2 v2.2.4
 	github.com/tarm/serial v0.0.0-20180830185346-98f6abe2eb07
 	periph.io/x/conn/v3 v3.7.0
 	periph.io/x/host/v3 v3.8.2

@@ -23,6 +23,8 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strconv"
 	"time"
 
 	"github.com/TheCacophonyProject/go-utils/logging"
@@ -33,21 +35,36 @@ import (
 const (
 	// dischargeTempLimitC   = 80.0 // °C - stop discharging above this temperature
 	chargeTimeoutDuration = 12 * time.Hour
-	testDataDir           = "/var/lib/solar-battery-tester/data"
 	logRate               = 10 * time.Minute
+	// How long the pack has to be silent before it counts as unplugged.
+	batteryRemovedAfter = 30 * time.Second
 )
 
 var log = logging.NewLogger("info")
 var version = "No version provided"
 
+// Where runs are written, and where their zips wait until the server has them.
+// A var rather than a const so tests can point it at a temporary directory.
+var testDataDir = "/var/lib/solar-battery-tester/data"
+
 type Args struct {
 	BatterySerial string `arg:"--battery-serial" default:"/dev/serial0" help:"Serial device for battery UART"`
 
+	// Where finished runs get posted. Normally this comes from the config
+	// file; these are for overriding it for a one-off run. With no URL from
+	// either, runs are kept locally to upload later.
+	ConfigPath     string `arg:"--config" default:"/etc/solar-battery-tester/config.toml" help:"Path to the TOML config file"`
+	ServerURL      string `arg:"--server-url" help:"Base URL of the battery run server, overriding the config file"`
+	ServerPort     int    `arg:"--server-port" help:"Port of the battery run server, overriding the config file"`
+	ServerUsername string `arg:"--server-username" help:"Username for the server's basic auth, overriding the config file"`
+	ServerPassword string `arg:"--server-password" help:"Password for the server's basic auth, overriding the config file"`
+
 	// Unit Tests
-	TestSerial *subcommand `arg:"subcommand:test-serial" help:"Test the serial port connection and exit"`
-	TestADC    *subcommand `arg:"subcommand:test-adc" help:"Read and print the values from the ADC"`
-	TestOCD    *subcommand `arg:"subcommand:test-ocd" help:"Test Over Current Detection (OCD)"`
-	TestSCD    *subcommand `arg:"subcommand:test-scd" help:"Test Short Circuit Detection (SCD)"`
+	CheckServer *subcommand `arg:"subcommand:check-server" help:"Check the server address and credentials from the config, and exit"`
+	TestSerial  *subcommand `arg:"subcommand:test-serial" help:"Test the serial port connection and exit"`
+	TestADC     *subcommand `arg:"subcommand:test-adc" help:"Read and print the values from the ADC"`
+	TestOCD     *subcommand `arg:"subcommand:test-ocd" help:"Test Over Current Detection (OCD)"`
+	TestSCD     *subcommand `arg:"subcommand:test-scd" help:"Test Short Circuit Detection (SCD)"`
 
 	// Sequences
 	RunChargeSeq        *subcommandDuration `arg:"subcommand:run-charge-seq" help:"Run the charge sequence and exit"`
@@ -79,6 +96,7 @@ const (
 )
 
 type subcommandStorage struct {
+	subcommandDuration
 	SOCMinVolt float64 `arg:"--soc-min-voltage" default:"10.2" help:"Resting pack voltage at 20 percent SOC, the bottom of the storage window."`
 	SOCMaxVolt float64 `arg:"--soc-max-voltage" default:"10.5" help:"Resting pack voltage at 30 percent SOC, the top of the storage window."`
 }
@@ -99,6 +117,42 @@ func runMain() error {
 	arg.MustParse(&args)
 	log = logging.NewLogger(args.LogLevel)
 	log.Printf("running version: %s", version)
+
+	// Before the hardware: a config that can't be used should say so straight
+	// away, on any machine, rather than after a HAT has been found.
+	cfg, err := loadConfig(args.ConfigPath)
+	if err != nil {
+		return err
+	}
+	server, err := serverFromConfig(cfg, args)
+	if err != nil {
+		return err
+	}
+	if server.enabled() {
+		log.Infof("Runs will be uploaded to %s", server.url)
+	} else {
+		log.Warnf("No server configured in %s, runs will be kept in %s only.",
+			args.ConfigPath, testDataDir)
+	}
+
+	// check-server is that check on its own, with the answer as the exit status,
+	// for confirming a config without starting a test.
+	if args.CheckServer != nil {
+		if !server.enabled() {
+			return fmt.Errorf("no server is configured in %s", args.ConfigPath)
+		}
+		return checkServer(server)
+	}
+
+	if server.enabled() {
+		// Not fatal: a tester whose server is down or misconfigured should still
+		// test batteries and hold on to the runs. But it says so now, loudly,
+		// rather than leaving it to be found at the end of a test.
+		if err := checkServer(server); err != nil {
+			log.Errorf("Checking the server: %v", err)
+			log.Errorf("Runs will be kept in %s until this is sorted out.", testDataDir)
+		}
+	}
 
 	// Initialize periph
 	if _, err := host.Init(); err != nil {
@@ -210,7 +264,7 @@ func runMain() error {
 
 	// Run Storage Sequence
 	if args.RunStorageSeq != nil {
-		return hw.runStorageSeq(battStateChan, "./", args.RunStorageSeq.SOCMinVolt, args.RunStorageSeq.SOCMaxVolt)
+		return hw.runStorageSeq(battStateChan, "./", args.RunStorageSeq.SOCMinVolt, args.RunStorageSeq.SOCMaxVolt, args.RunStorageSeq.Duration)
 	}
 
 	// Check the pack is ready for storage
@@ -220,8 +274,12 @@ func runMain() error {
 
 	if args.RunFullTests != nil {
 		for {
+			// Anything a previous run couldn't hand over, because the network or
+			// the server was down, goes now.
+			uploadPending(server)
+
 			// Run full test
-			err := runFullTest(hw, battStateChan, args)
+			err := runFullTest(hw, battStateChan, args, server)
 			if err != nil {
 				log.Errorf("Full test failed/errored: %v", err)
 				hw.flashLED(200, 0, 0)
@@ -230,42 +288,21 @@ func runMain() error {
 				hw.flashLED(0, 200, 0)
 			}
 
-			// Wait for USB to be disconnected
-			log.Info("Waiting for USB to be disconnected.")
-			if err := waitForUSBRemoval(); err != nil {
-				log.Errorf("waiting for USB removal: %v", err)
-			}
-			log.Info("USB disconnected.")
+			// Wait for the pack to be unplugged before starting on the next one,
+			// so a finished test isn't immediately followed by another run on the
+			// same battery.
+			log.Info("Waiting for the battery to be unplugged.")
+			waitForBatteryRemoval(battStateChan)
+			log.Info("Battery unplugged.")
 		}
 	}
 
 	return nil
 }
 
-func runFullTest(hw *hardware, battStateChan chan BatteryStatus, args Args) error {
+func runFullTest(hw *hardware, battStateChan chan BatteryStatus, args Args, server serverConfig) error {
 	log.Info("=== Full Test Sequence Setup ===\n")
 	hw.solidLED(true, false, false)
-
-	testDuration := args.RunFullTests.Duration
-
-	log.Info("=== Waiting for USB device to be connected. ===")
-	usbMountPath, err := waitForUSBDrive()
-	if err != nil {
-		return fmt.Errorf("waiting for USB device: %v", err)
-	}
-	log.Infof("Found USB device, mounted at %s.\n", usbMountPath)
-	hw.flashLED(1000, 0, 0)
-
-	// The drive gets pulled after every run so its data can be copied off, then
-	// plugged back in for the next battery. Unmount cleanly and wait for it to
-	// actually be removed before returning, regardless of how the test below
-	// turns out, so it's never yanked while still mounted.
-	defer func() {
-		log.Info("=== Unmounting USB drive — safe to remove it now ===")
-		if err := unmountUSBDrive(); err != nil {
-			log.Errorf("unmounting USB drive: %v", err)
-		}
-	}()
 
 	log.Info("=== Waiting for battery to be plugged in ===")
 	batteryState := <-battStateChan
@@ -274,16 +311,108 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, args Args) erro
 
 	log.Info("=== Running Full Test Sequence ===\n")
 
-	results := &testResults{}
+	batteryID := int(batteryState.BatteryID)
+	// The run's identity: the server takes all three of these out of
+	// results.json, and the folder name is built from the same values so the
+	// two can't disagree.
+	results := &testResults{
+		BatteryID:  batteryID,
+		TesterName: testerName(),
+		Timestamp:  time.Now(),
+	}
 
-	resultsFolderName := fmt.Sprintf("Battery_%d___Time_%s", batteryState.BatteryID, time.Now().Format("2006-01-02_15-04-05"))
+	resultsFolderName := runFolderName(batteryID, results.TesterName, results.Timestamp)
 
-	resultsDir := filepath.Join(usbMountPath, resultsFolderName)
+	resultsDir := filepath.Join(testDataDir, resultsFolderName)
 	if err := os.MkdirAll(resultsDir, 0o755); err != nil {
 		return fmt.Errorf("error creating results directory: %v", err)
 	}
 	log.Infof("Saving results to: %s", resultsDir)
 	time.Sleep(time.Second)
+
+	// A test that fails is the one whose readings are most worth looking at, so
+	// the results are zipped and sent whichever way the sequence below turns out.
+	testErr := runTestSteps(hw, battStateChan, args, results, resultsDir)
+	results.Completed = testErr == nil
+	if testErr != nil {
+		results.FailureReason = testErr.Error()
+	}
+
+	log.Println("=== Results ===")
+	results.print()
+
+	if err := results.save(resultsDir); err != nil {
+		log.Errorf("saving results.json: %v", err)
+	}
+
+	zipPath := filepath.Join(testDataDir, resultsFolderName+".zip")
+	log.Infof("Zipping results to: %s", zipPath)
+	if err := zipDir(resultsDir, zipPath); err != nil {
+		log.Errorf("zipping results directory: %v", err)
+		return testErr
+	}
+
+	log.Infof("Uploading %s", filepath.Base(zipPath))
+	verdict, err := uploadRun(server, zipPath, batteryID)
+	if err != nil {
+		// The zip stays in testDataDir and the next run will offer it again, so
+		// a server that's down doesn't cost the run's data. The sequence itself
+		// is what it is, so its own result still stands.
+		log.Errorf("Uploading run: %v", err)
+		return testErr
+	}
+	verdict.log()
+
+	// The pack can get through the whole sequence and still be a pack that
+	// failed: the capacity and temperature checks are the server's to make. So
+	// its verdict decides the run, and a failing one flashes red like any other
+	// failure.
+	if testErr == nil {
+		return verdict.verdictError()
+	}
+
+	return testErr
+}
+
+// runFolderName is the name a run is known by, on the tester and on the server,
+// e.g. "Battery_126_Tester_bt-6329_Time_2026-09-08_09-27-56". The tester is in
+// the name so a run can be traced back to the rig that produced it from the
+// filename alone, without opening the zip.
+func runFolderName(batteryID int, tester string, at time.Time) string {
+	return fmt.Sprintf("Battery_%d_Tester_%s_Time_%s", batteryID, tester, at.Format("2006-01-02_15-04-05"))
+}
+
+// batteryIDFromRunName reads the battery ID back out of a run's name, for zips
+// found in testDataDir that are waiting to be uploaded.
+func batteryIDFromRunName(name string) (int, error) {
+	m := runNamePattern.FindStringSubmatch(name)
+	if m == nil {
+		return 0, fmt.Errorf("%q isn't a run name of the form Battery_<id>_Tester_<name>_Time_<time>", name)
+	}
+	return strconv.Atoi(m[1])
+}
+
+// runNamePattern also matches the older Battery_<id>___Time_<time> names, so a
+// zip written by a previous version and still waiting to be uploaded is not
+// stranded by the rename.
+var runNamePattern = regexp.MustCompile(`^Battery_(\d+)(?:_Tester_[A-Za-z0-9.-]+)?_+Time_`)
+
+// waitForBatteryRemoval blocks until the pack has stopped reporting for
+// batteryRemovedAfter, i.e. it has been unplugged from the tester.
+func waitForBatteryRemoval(battStateChan chan BatteryStatus) {
+	for {
+		select {
+		case <-battStateChan:
+		case <-time.After(batteryRemovedAfter):
+			return
+		}
+	}
+}
+
+// runTestSteps runs the test sequence itself, recording what it finds in results
+// and its readings in resultsDir.
+func runTestSteps(hw *hardware, battStateChan chan BatteryStatus, args Args, results *testResults, resultsDir string) error {
+	testDuration := args.RunFullTests.Duration
 
 	step := 1
 	log.Infof("=== Step %d: Waiting for cells to be balanced ===", step)
@@ -312,7 +441,7 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, args Args) erro
 	if err != nil {
 		return fmt.Errorf("OCD test errored: %v", err)
 	}
-	results.OCDPass = pass
+	results.OCDPassed = pass
 	time.Sleep(time.Second)
 
 	step++
@@ -321,7 +450,7 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, args Args) erro
 	if err != nil {
 		return fmt.Errorf("short circuit test errored: %v", err)
 	}
-	results.ShortCircuitPass = pass
+	results.SCDPassed = pass
 	time.Sleep(time.Second)
 
 	step++
@@ -336,8 +465,8 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, args Args) erro
 	// Slightly tighter voltage range so it should pass after it has settled down.
 	minVolt := defaultSOCMinVolt + 0.2*(defaultSOCMaxVolt-defaultSOCMinVolt)
 	maxVolt := defaultSOCMaxVolt - 0.2*(defaultSOCMaxVolt-defaultSOCMinVolt)
-	if err := hw.runStorageSeq(battStateChan, resultsDir, minVolt, maxVolt); err != nil {
-		return fmt.Errorf("charge step failed: %v", err)
+	if err := hw.runStorageSeq(battStateChan, resultsDir, minVolt, maxVolt, testDuration); err != nil {
+		return fmt.Errorf("storage charge step failed: %v", err)
 	}
 	time.Sleep(time.Second)
 
@@ -345,26 +474,6 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, args Args) erro
 	log.Infof("=== Step %d: Monitoring ===", step)
 	if err := hw.runMonitorTest(battStateChan, resultsDir, testDuration); err != nil {
 		return fmt.Errorf("monitor step failed: %v", err)
-	}
-	time.Sleep(time.Second)
-
-	step++
-	log.Infof("=== Step %d: Check battery at proper storage voltage ===", step)
-	if err := hw.checkStorageState(battStateChan, defaultSOCMinVolt, defaultSOCMaxVolt); err != nil {
-		return fmt.Errorf("check storage state failed: %v", err)
-	}
-
-	log.Println("=== Results ===")
-	results.print()
-
-	if err := results.save(resultsDir); err != nil {
-		log.Errorf("saving results.json: %v", err)
-	}
-
-	zipPath := resultsDir + ".zip"
-	log.Infof("Zipping results to: %s", zipPath)
-	if err := zipDir(resultsDir, zipPath); err != nil {
-		log.Errorf("zipping results directory: %v", err)
 	}
 
 	return nil
@@ -375,15 +484,36 @@ func runFullTest(hw *hardware, battStateChan chan BatteryStatus, args Args) erro
 // 	voltage float64
 // }
 
+// testResults is the summary written into each run as results.json. It is what
+// the server files the run by -- the battery, the tester and when the test
+// started all come from here rather than from the name of the zip -- and what
+// it shows for the run without unpacking the CSVs. The shape is the one
+// documented in client/README.md.
 type testResults struct {
-	OCDPass          bool `json:"ocdPass"`
-	ShortCircuitPass bool `json:"shortCircuitPass"`
+	Completed  bool      `json:"completed"`  // the test sequence ran to the end
+	OCDPassed  bool      `json:"ocdPassed"`  // over current protection passed
+	SCDPassed  bool      `json:"scdPassed"`  // short circuit protection passed
+	BatteryID  int       `json:"batteryID"`  // ID of the battery, from its EEPROM
+	TesterName string    `json:"testerName"` // hostname of the RPi that ran the test
+	Timestamp  time.Time `json:"timestamp"`  // when the test started, RFC 3339
+
+	// Why the sequence stopped, when it didn't finish. Not in the README's
+	// list because it's only there on a run that failed, but it is the first
+	// thing anyone looking at such a run wants to know.
+	FailureReason string `json:"failureReason,omitempty"`
 }
 
 func (r *testResults) print() {
 	log.Println("=== Test Results ===")
-	log.Printf("OCD protection (3A):    %s", passFailStr(r.OCDPass))
-	log.Printf("Short circuit protect:  %s", passFailStr(r.ShortCircuitPass))
+	log.Printf("Battery:                %d", r.BatteryID)
+	log.Printf("Tester:                 %s", r.TesterName)
+	log.Printf("Started:                %s", r.Timestamp.Format(time.RFC3339))
+	log.Printf("OCD protection (3A):    %s", passFailStr(r.OCDPassed))
+	log.Printf("Short circuit protect:  %s", passFailStr(r.SCDPassed))
+	log.Printf("Full test:              %s", passFailStr(r.Completed))
+	if r.FailureReason != "" {
+		log.Printf("Failed because:         %s", r.FailureReason)
+	}
 }
 
 // save writes the results as JSON into dir.
